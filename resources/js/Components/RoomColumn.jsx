@@ -1,4 +1,5 @@
 import { useState, useEffect, useLayoutEffect, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import { router } from '@inertiajs/react';
 import SessionRingTimer from './SessionRingTimer';
 
@@ -113,6 +114,22 @@ function isDeskBooking(item) {
     return /^\d+$/.test(String(item.id));
 }
 
+function isWebReservation(item) {
+    if (!item?.id) return false;
+    if (item.source === 'agenda-waw' || item.source === 'reservation') return true;
+    return String(item.id).startsWith('web-');
+}
+
+function reservationNumericId(item) {
+    const id = String(item?.id ?? '');
+    if (/^\d+$/.test(id)) return id;
+    if (id.startsWith('web-')) {
+        const num = id.slice(4);
+        return /^\d+$/.test(num) ? num : null;
+    }
+    return null;
+}
+
 const inputClass =
     'w-full rounded-xl border-2 border-black/15 bg-white px-3 py-2.5 text-sm text-black outline-none transition focus:border-black';
 
@@ -143,11 +160,11 @@ function OverflowMenu({ open, onToggle, items }) {
 
             setMenuStyle({
                 position: 'fixed',
-                right: window.innerWidth - buttonRect.right,
+                right: Math.max(8, window.innerWidth - buttonRect.right),
                 ...(openUpward
                     ? { bottom: window.innerHeight - buttonRect.top + 4 }
                     : { top: buttonRect.bottom + 4 }),
-                zIndex: 70,
+                zIndex: 9999,
             });
         };
 
@@ -160,48 +177,59 @@ function OverflowMenu({ open, onToggle, items }) {
         };
     }, [open, items.length]);
 
+    const handleToggle = (event) => {
+        event.stopPropagation();
+        onToggle();
+    };
+
+    const menuPortal =
+        open && typeof document !== 'undefined'
+            ? createPortal(
+                  <>
+                      <button
+                          type="button"
+                          className="fixed inset-0 z-[9998] cursor-default"
+                          aria-label="Close menu"
+                          onClick={onToggle}
+                      />
+                      <div
+                          style={menuStyle ?? { visibility: 'hidden', position: 'fixed', zIndex: 9999 }}
+                          className="min-w-[10.5rem] overflow-hidden rounded-xl border-2 border-black bg-[#FFFDF5] py-1 shadow-lg"
+                      >
+                          {items.map((item) => (
+                              <button
+                                  key={item.label}
+                                  type="button"
+                                  disabled={item.disabled}
+                                  onClick={() => {
+                                      item.onClick?.();
+                                      onToggle();
+                                  }}
+                                  className={`block w-full px-3 py-2 text-left text-[13px] font-bold transition hover:bg-[#FFD400]/50 disabled:opacity-35 ${
+                                      item.danger ? 'text-red-600' : 'text-black'
+                                  }`}
+                              >
+                                  {item.label}
+                              </button>
+                          ))}
+                      </div>
+                  </>,
+                  document.body
+              )
+            : null;
+
     return (
         <div className="relative shrink-0">
             <button
                 ref={buttonRef}
                 type="button"
-                onClick={onToggle}
+                onClick={handleToggle}
                 className="flex h-9 w-9 items-center justify-center rounded-xl border-2 border-black/15 bg-white text-lg font-bold text-black transition hover:border-black hover:bg-[#FFD400]"
                 aria-label="More actions"
             >
                 ⋯
             </button>
-            {open && (
-                <>
-                    <button
-                        type="button"
-                        className="fixed inset-0 z-[60] cursor-default"
-                        aria-label="Close menu"
-                        onClick={onToggle}
-                    />
-                    <div
-                        style={menuStyle ?? { visibility: 'hidden', position: 'fixed' }}
-                        className="min-w-[10.5rem] overflow-hidden rounded-xl border-2 border-black bg-[#FFFDF5] py-1 shadow-lg"
-                    >
-                        {items.map((item) => (
-                            <button
-                                key={item.label}
-                                type="button"
-                                disabled={item.disabled}
-                                onClick={() => {
-                                    item.onClick?.();
-                                    onToggle();
-                                }}
-                                className={`block w-full px-3 py-2 text-left text-[13px] font-bold transition hover:bg-[#FFD400]/50 disabled:opacity-35 ${
-                                    item.danger ? 'text-red-600' : 'text-black'
-                                }`}
-                            >
-                                {item.label}
-                            </button>
-                        ))}
-                    </div>
-                </>
-            )}
+            {menuPortal}
         </div>
     );
 }
@@ -395,6 +423,8 @@ export default function RoomColumn({ room, onOpenBooking }) {
 
     function checkoutNow() {
         if (!room.bookingId) return;
+        const clientName = room.currentClient || 'this guest';
+        if (!confirm(`Check out ${clientName}? This will free the room.`)) return;
         router.post(`/bookings/${room.bookingId}/checkout`, {}, { preserveScroll: true });
     }
 
@@ -415,6 +445,14 @@ export default function RoomColumn({ room, onOpenBooking }) {
         }
     }
 
+    function cancelReservation(item) {
+        const id = reservationNumericId(item);
+        if (!id) return;
+        if (confirm('Cancel this web reservation?')) {
+            router.post(`/reservations/${id}/cancel`, {}, { preserveScroll: true });
+        }
+    }
+
     function pushBooking(bookingId, minutes) {
         if (!/^\d+$/.test(String(bookingId))) return;
         router.post(`/bookings/${bookingId}/delay`, { minutes }, { preserveScroll: true });
@@ -429,7 +467,11 @@ export default function RoomColumn({ room, onOpenBooking }) {
 
     function openEditBookingModal(booking) {
         setEditingBooking(booking);
-        setEditBookingName(booking.clientName || '');
+        let name = booking.clientName || '';
+        if (isWebReservation(booking) && name.startsWith('Web · ')) {
+            name = name.slice(6);
+        }
+        setEditBookingName(name);
         setEditBookingStartTime(
             booking.start
                 ? booking.start.substring(0, 5)
@@ -454,16 +496,29 @@ export default function RoomColumn({ room, onOpenBooking }) {
 
     function submitEditBooking(e) {
         e.preventDefault();
-        if (!editingBooking?.id || !isDeskBooking(editingBooking)) return;
-        router.post(
-            `/bookings/${editingBooking.id}/update`,
-            {
-                client_name: editBookingName,
-                start_clock_time: editBookingStartTime,
-                duration_minutes: editBookingDuration,
-            },
-            { preserveScroll: true, onSuccess: () => setEditingBooking(null) }
-        );
+        if (!editingBooking?.id) return;
+
+        const payload = {
+            client_name: editBookingName,
+            start_clock_time: editBookingStartTime,
+            duration_minutes: editBookingDuration,
+        };
+
+        if (isDeskBooking(editingBooking)) {
+            router.post(`/bookings/${editingBooking.id}/update`, payload, {
+                preserveScroll: true,
+                onSuccess: () => setEditingBooking(null),
+            });
+            return;
+        }
+
+        const reservationId = reservationNumericId(editingBooking);
+        if (!reservationId) return;
+
+        router.post(`/reservations/${reservationId}/update`, payload, {
+            preserveScroll: true,
+            onSuccess: () => setEditingBooking(null),
+        });
     }
 
     const totalDurationMs =
@@ -725,7 +780,9 @@ export default function RoomColumn({ room, onOpenBooking }) {
                                 )}
                                 <OverflowMenu
                                     open={openMenu === 'active'}
-                                    onToggle={() => setOpenMenu(openMenu === 'active' ? null : 'active')}
+                                    onToggle={() =>
+                                        setOpenMenu((prev) => (prev === 'active' ? null : 'active'))
+                                    }
                                     items={[{ label: 'Edit session', onClick: openEditModal }]}
                                 />
                             </div>
@@ -809,13 +866,23 @@ export default function RoomColumn({ room, onOpenBooking }) {
                                 const bookingMethod = paymentLabel(b.paymentMethod, bookingComplimentary);
                                 const menuKey = `up-${b.id}`;
                                 const deskBooking = isDeskBooking(b);
+                                const webReservation = isWebReservation(b);
 
                                 const menuItems = deskBooking
                                     ? [
                                           { label: 'Edit', onClick: () => openEditBookingModal(b) },
                                           { label: 'Check in', onClick: () => checkIn(b.id) },
                                       ]
-                                    : [];
+                                    : webReservation
+                                      ? [
+                                            { label: 'Edit', onClick: () => openEditBookingModal(b) },
+                                            {
+                                                label: 'Cancel',
+                                                danger: true,
+                                                onClick: () => cancelReservation(b),
+                                            },
+                                        ]
+                                      : [];
                                 if (deskBooking && !isMaxPushed && remainingPush >= 10) {
                                     menuItems.push({ label: '+10 min', onClick: () => pushBooking(b.id, 10) });
                                 }
@@ -888,9 +955,15 @@ export default function RoomColumn({ room, onOpenBooking }) {
                                             </p>
                                         </div>
 
-                                        {!deskBooking && (
+                                        {webReservation && (
                                             <span className="shrink-0 rounded-lg border-2 border-black/20 bg-[#F7F4EC] px-2 py-1 text-[10px] font-black uppercase tracking-wide text-black/45">
                                                 Web
+                                            </span>
+                                        )}
+
+                                        {deskBooking && (
+                                            <span className="shrink-0 rounded-lg border-2 border-black/20 bg-[#FFFBEA] px-2 py-1 text-[10px] font-black uppercase tracking-wide text-black/55">
+                                                Local
                                             </span>
                                         )}
 
@@ -917,11 +990,13 @@ export default function RoomColumn({ room, onOpenBooking }) {
                                             </button>
                                         )}
 
-                                        {deskBooking && menuItems.length > 0 && (
+                                        {menuItems.length > 0 && (
                                             <OverflowMenu
                                                 open={openMenu === menuKey}
                                                 onToggle={() =>
-                                                    setOpenMenu(openMenu === menuKey ? null : menuKey)
+                                                    setOpenMenu((prev) =>
+                                                        prev === menuKey ? null : menuKey
+                                                    )
                                                 }
                                                 items={menuItems}
                                             />

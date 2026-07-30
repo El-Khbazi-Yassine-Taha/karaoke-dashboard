@@ -148,7 +148,7 @@ class RoomAvailabilityService
                 'status' => 'WEB',
                 'pushed_minutes' => 0,
                 'originalStart' => Carbon::parse($res->check_in)->format('H:i'),
-                'source' => 'reservation',
+                'source' => $res->source ?? 'reservation',
             ]);
 
         $upcomingFormatted = collect($upcoming->map(fn ($b) => $this->formatBooking($b, $current?->id))->all())
