@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <defs>
+    <linearGradient id="g" x1="32" y1="6" x2="32" y2="58" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFE566"/>
+      <stop offset="0.45" stop-color="#F5B400"/>
+      <stop offset="1" stop-color="#E07800"/>
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="130%" height="130%">
+      <feDropShadow dx="1" dy="2" stdDeviation="1.2" flood-color="#000" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+  <!-- Blocky slanted W matching brand mark -->
+  <g filter="url(#shadow)" transform="skewX(-8) translate(4 0)">
+    <path
+      fill="url(#g)"
+      stroke="#2a1800"
+      stroke-width="2"
+      stroke-linejoin="miter"
+      d="M8 8h11l4.5 28L32 12h8l8.5 24L53 8h11L51 56H37l-5-18-5 18H13L8 8z"
+    />
+  </g>
+</svg>

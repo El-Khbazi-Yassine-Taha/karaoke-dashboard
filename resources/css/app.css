@@ -1,0 +1,119 @@
+@import "tailwindcss";
+
+@source "../**/*.{blade.php,js,jsx}";
+
+@theme {
+    --font-sans: "Segoe UI", ui-sans-serif, system-ui, -apple-system, sans-serif;
+    --color-waw: #FFD400;
+    --color-ink: #111111;
+    --color-muted: #6B6B6B;
+    --color-line: #E5E5E5;
+    --color-surface: #FFFDF5;
+    --color-page: #FFD400;
+}
+
+body {
+    font-family: var(--font-sans);
+    color: var(--color-ink);
+    background: var(--color-page);
+    -webkit-font-smoothing: antialiased;
+}
+
+/* Primary CTA — WAW yellow */
+.btn-waw {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.4rem;
+    min-height: 2.65rem;
+    padding: 0.65rem 1.25rem;
+    border: 2px solid #111111;
+    border-radius: 0.75rem;
+    background: #FFD400;
+    color: #111111;
+    font-size: 0.875rem;
+    font-weight: 700;
+    letter-spacing: 0.01em;
+    transition: background 0.15s ease, transform 0.1s ease;
+    cursor: pointer;
+}
+
+.btn-waw:hover:not(:disabled) {
+    background: #FFE14D;
+}
+
+.btn-waw:active:not(:disabled) {
+    transform: translateY(1px);
+}
+
+.btn-waw:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+.btn-waw-block {
+    width: 100%;
+}
+
+/* Secondary — black */
+.btn-waw-ghost,
+.btn-waw-dark {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.4rem;
+    min-height: 2.65rem;
+    padding: 0.65rem 1.25rem;
+    border: 2px solid #111111;
+    border-radius: 0.75rem;
+    background: #111111;
+    color: #FFD400;
+    font-size: 0.875rem;
+    font-weight: 700;
+    transition: background 0.15s ease;
+    cursor: pointer;
+}
+
+.btn-waw-ghost:hover:not(:disabled),
+.btn-waw-dark:hover:not(:disabled) {
+    background: #2a2a2a;
+}
+
+.btn-waw-ghost:disabled,
+.btn-waw-dark:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+.page-rise {
+    animation: fadeRise 0.35s ease-out both;
+}
+
+.page-rise-delay-1 { animation-delay: 0.04s; }
+.page-rise-delay-2 { animation-delay: 0.08s; }
+.page-rise-delay-3 { animation-delay: 0.12s; }
+
+@keyframes fadeRise {
+    from { opacity: 0; transform: translateY(6px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+.waw-bg-drift {
+    background-repeat: no-repeat;
+    will-change: transform;
+    animation: wawBgDrift 28s ease-in-out infinite alternate;
+    transform-origin: center center;
+}
+
+@keyframes wawBgDrift {
+    0% { transform: scale(1.08) translate3d(-1.5%, -1%, 0); }
+    50% { transform: scale(1.12) translate3d(1.5%, 1.2%, 0); }
+    100% { transform: scale(1.1) translate3d(-0.8%, 1.5%, 0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .waw-bg-drift {
+        animation: none;
+        transform: none;
+    }
+}

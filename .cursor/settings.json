@@ -1,0 +1,7 @@
+{
+  "plugins": {
+    "higgsfield": {
+      "enabled": true
+    }
+  }
+}
