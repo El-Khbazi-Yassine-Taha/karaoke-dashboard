@@ -111,9 +111,40 @@ body {
     100% { transform: scale(1.1) translate3d(-0.8%, 1.5%, 0); }
 }
 
+/* Time-up alert: flash red ↔ normal cream */
+.urgent-timeup-overlay {
+    animation: urgentFlash 1s ease-in-out infinite;
+    backdrop-filter: blur(2px);
+}
+
+.urgent-timeup-overlay .urgent-timeup-label,
+.urgent-timeup-overlay .urgent-timeup-sub {
+    opacity: 0.85;
+}
+
+@keyframes urgentFlash {
+    0%,
+    100% {
+        background-color: rgb(220 38 38 / 0.96);
+        box-shadow: inset 0 0 60px rgb(127 29 29 / 0.55);
+        color: #fff;
+    }
+    50% {
+        background-color: rgb(255 253 245 / 0.98);
+        box-shadow: inset 0 0 40px rgb(255 212 0 / 0.35);
+        color: #111;
+    }
+}
+
 @media (prefers-reduced-motion: reduce) {
     .waw-bg-drift {
         animation: none;
         transform: none;
+    }
+
+    .urgent-timeup-overlay {
+        animation: none;
+        background-color: rgb(220 38 38 / 0.96);
+        color: #fff;
     }
 }

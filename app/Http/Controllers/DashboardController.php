@@ -79,7 +79,15 @@ class DashboardController extends Controller
 
     private function reservationsPayload(): array
     {
-        return Reservation::orderBy('check_in', 'asc')
+        return Reservation::query()
+            ->where(function ($q) {
+                $q->whereNull('client_email')
+                    ->orWhere('client_email', '!=', 'desk@waw.local');
+            })
+            ->where('client_name', 'not like', 'Desk ·%')
+            ->whereNotIn('status', ['cancelled', 'no_show'])
+            ->whereDate('date', '>=', Carbon::today()->subDay())
+            ->orderBy('check_in', 'asc')
             ->get()
             ->map(function (Reservation $res) {
                 return [

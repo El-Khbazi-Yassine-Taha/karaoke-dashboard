@@ -4,9 +4,10 @@
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <title inertia>{{ config('app.name', 'WAW Karaoke') }}</title>
+        <link rel="icon" href="/waw-favicon.png" type="image/png">
         <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-        <link rel="icon" href="/favicon.png" type="image/png" sizes="32x32">
-        <link rel="shortcut icon" href="/favicon.ico">
+        <link rel="apple-touch-icon" href="/waw-favicon.png">
+        <link rel="shortcut icon" href="/waw-favicon.png">
 
         <!-- FIXED: Added the React Refresh preamble required by Vite -->
         @viteReactRefresh

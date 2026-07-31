@@ -127,4 +127,18 @@ class Booking extends Model
             ->whereDate('start_time', $moment->toDateString())
             ->orderBy('start_time');
     }
+
+    /** Another guest is already in the room (must check out before a new session starts). */
+    public static function liveSessionInRoom(int $roomId, ?int $exceptBookingId = null): ?self
+    {
+        $now = now();
+
+        return static::query()
+            ->where('room_id', $roomId)
+            ->where('status', 'in_progress')
+            ->where('end_time', '>', $now)
+            ->when($exceptBookingId, fn (Builder $q) => $q->where('id', '!=', $exceptBookingId))
+            ->orderBy('start_time')
+            ->first();
+    }
 }

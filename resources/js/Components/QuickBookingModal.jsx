@@ -44,6 +44,11 @@ export default function QuickBookingModal({ open, onClose, rooms, selectedRoomId
 
     const [submitting, setSubmitting] = useState(false);
     const [serverErrors, setServerErrors] = useState({});
+    const [webSlotStatus, setWebSlotStatus] = useState(null); // { available, label } | null
+    const [webSlotLoading, setWebSlotLoading] = useState(false);
+
+    const selectedRoom = rooms.find((r) => String(r.id) === String(roomId));
+    const effectiveDuration = customDuration ? parseInt(customDuration, 10) : duration;
 
     // Sync room & default time when modal opens
     useEffect(() => {
@@ -62,11 +67,52 @@ export default function QuickBookingModal({ open, onClose, rooms, selectedRoomId
             setIsComplimentary(false);
             setInvitedBy('');
             setServerErrors({});
+            setWebSlotStatus(null);
         }
     }, [open, selectedRoomId, rooms]);
 
-    const selectedRoom = rooms.find((r) => String(r.id) === String(roomId));
-    const effectiveDuration = customDuration ? parseInt(customDuration, 10) : duration;
+    // Check agenda-waw for Libre / Déjà réservé on the chosen hour
+    useEffect(() => {
+        if (!open) return;
+
+        const date = new Date();
+        const dateStr = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+        let time = startNow ? currentHHMM() : clockTime;
+        if (startNow && selectedRoom?.state === 'occupied' && selectedRoom.checkoutTime) {
+            time = selectedRoom.checkoutTime;
+        }
+        const hour = `${String(time).slice(0, 2)}:00`;
+
+        let cancelled = false;
+        setWebSlotLoading(true);
+        fetch(`/agenda/availability?date=${encodeURIComponent(dateStr)}&time=${encodeURIComponent(hour)}`, {
+            headers: { Accept: 'application/json' },
+            credentials: 'same-origin',
+        })
+            .then((r) => r.json())
+            .then((data) => {
+                if (cancelled) return;
+                if (typeof data?.available === 'boolean') {
+                    setWebSlotStatus({
+                        available: data.available,
+                        label: data.label || (data.available ? 'Libre' : 'Déjà réservé'),
+                        time: hour,
+                    });
+                } else {
+                    setWebSlotStatus(null);
+                }
+            })
+            .catch(() => {
+                if (!cancelled) setWebSlotStatus(null);
+            })
+            .finally(() => {
+                if (!cancelled) setWebSlotLoading(false);
+            });
+
+        return () => {
+            cancelled = true;
+        };
+    }, [open, startNow, clockTime, selectedRoom, roomId]);
 
     // Calculate dynamic price safely handling empty states
     const parsedMembers = membersCount === '' ? 1 : membersCount;
@@ -164,6 +210,11 @@ export default function QuickBookingModal({ open, onClose, rooms, selectedRoomId
     function submit(e) {
         e.preventDefault();
 
+        if (webSlotStatus && webSlotStatus.available === false) {
+            alert('❌ Déjà réservé (web)\n\nCe créneau est pris sur agenda-waw. Choisissez un autre horaire.');
+            return;
+        }
+
         if (collisionState.status === 'busy_conflict' || collisionState.status === 'closing_violation') {
             alert(`❌ TIME BLOCKED:\n\n${collisionState.message}`);
             return;
@@ -202,11 +253,6 @@ export default function QuickBookingModal({ open, onClose, rooms, selectedRoomId
             {
                 preserveScroll: true,
                 onSuccess: () => {
-                    // Skip payment overlay only for complimentary invites (already free)
-                    if (isComplimentary && typeof window !== 'undefined') {
-                        window.__freshBookingRoomIds = window.__freshBookingRoomIds || new Set();
-                        window.__freshBookingRoomIds.add(String(roomId));
-                    }
                     setClientName('');
                     setCustomDuration('');
                     setMembersCount(1);
@@ -229,13 +275,25 @@ export default function QuickBookingModal({ open, onClose, rooms, selectedRoomId
 
     return (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
-            <div className="max-h-[90vh] w-full max-w-md overflow-y-auto rounded-2xl border-2 border-black bg-[#FFFDF5] p-6 shadow-[4px_4px_0_#000]">
-                <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-[#8A7400]">
-                    Reservation
-                </p>
-                <h2 className="mb-5 mt-1 text-xl font-semibold tracking-tight text-[#111]">New booking</h2>
+            <div className="flex max-h-[90vh] w-full max-w-md flex-col overflow-hidden rounded-2xl border-2 border-black bg-[#FFFDF5] shadow-[4px_4px_0_#000]">
+                <div className="flex shrink-0 items-start justify-between gap-3 border-b border-[#E8E4D9] px-6 pb-4 pt-6">
+                    <div>
+                        <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-[#8A7400]">
+                            Reservation
+                        </p>
+                        <h2 className="mt-1 text-xl font-semibold tracking-tight text-[#111]">New booking</h2>
+                    </div>
+                    <button
+                        type="button"
+                        onClick={onClose}
+                        aria-label="Close"
+                        className="rounded-lg px-2 py-1 text-[#6B6B6B] transition hover:bg-[#F7F4EC] hover:text-[#111]"
+                    >
+                        ✕
+                    </button>
+                </div>
 
-                <form onSubmit={submit} className="space-y-4">
+                <form onSubmit={submit} className="space-y-4 overflow-y-auto px-6 py-5">
                     <div>
                         <label className="mb-1 block text-[10px] font-semibold uppercase tracking-wide text-[#6B6B6B]">
                             Client name
@@ -274,11 +332,31 @@ export default function QuickBookingModal({ open, onClose, rooms, selectedRoomId
                                 >
                                     <div className="font-semibold">{room.name}</div>
                                     <div className={`text-xs ${String(roomId) === String(room.id) ? 'text-white/70' : 'text-[#6B6B6B]'}`}>
-                                        {room.state === 'free' ? 'Available now' : `Busy until ${room.checkoutTime}`}
+                                        {room.state === 'free' ? 'Libre' : `Occupé jusqu’à ${room.checkoutTime}`}
                                     </div>
                                 </button>
                             ))}
                         </div>
+                    </div>
+
+                    <div className="rounded-lg border border-[#E8E4D9] bg-[#F7F4EC] px-3 py-2 text-sm">
+                        <p className="text-[10px] font-semibold uppercase tracking-wide text-[#6B6B6B]">
+                            Agenda web · créneau horaire
+                        </p>
+                        {webSlotLoading ? (
+                            <p className="mt-1 text-[#6B6B6B]">Vérification…</p>
+                        ) : webSlotStatus ? (
+                            <p
+                                className={`mt-1 font-semibold ${
+                                    webSlotStatus.available ? 'text-emerald-700' : 'text-red-700'
+                                }`}
+                            >
+                                {webSlotStatus.time} — {webSlotStatus.label}
+                                {!webSlotStatus.available ? ' (web)' : ''}
+                            </p>
+                        ) : (
+                            <p className="mt-1 text-[#6B6B6B]">Disponibilité web indisponible</p>
+                        )}
                     </div>
 
                     <div>
@@ -396,7 +474,7 @@ export default function QuickBookingModal({ open, onClose, rooms, selectedRoomId
                                     onChange={(e) => setInvitedBy(e.target.value)}
                                     required={isComplimentary}
                                     className={field}
-                                    placeholder="e.g. Sara"
+                                    placeholder="e.g. Name"
                                 />
                                 {serverErrors.invited_by && (
                                     <p className="mt-1 text-sm text-red-600">{serverErrors.invited_by}</p>

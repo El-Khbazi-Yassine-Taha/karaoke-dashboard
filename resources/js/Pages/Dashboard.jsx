@@ -15,10 +15,13 @@ export default function Dashboard({
     durationPresets,
     reservations = [],
 }) {
-    const { flash } = usePage().props;
+    const { flash, errors } = usePage().props;
     const [modalOpen, setModalOpen] = useState(false);
     const [selectedRoomId, setSelectedRoomId] = useState(null);
     const [historyOpen, setHistoryOpen] = useState(false);
+
+    const errorMessage =
+        errors?.check_in || errors?.start || errors?.room_id || errors?.booking || null;
 
     useEffect(() => {
         const interval = window.setInterval(async () => {
@@ -52,12 +55,18 @@ export default function Dashboard({
             <div className="mx-auto w-full max-w-7xl px-4 py-6 sm:px-6 lg:px-8">
                 <div className="flex flex-col gap-5">
                     <div className="relative z-50 page-rise">
-                        <LiveAvailabilityHeader />
+                        <LiveAvailabilityHeader serverTimestamp={serverTimestamp} />
                     </div>
 
                     {flash?.success && (
                         <div className="page-rise rounded-xl border-2 border-black bg-[#FFD400]/85 px-4 py-3 text-sm font-bold text-black backdrop-blur-sm">
                             {flash.success}
+                        </div>
+                    )}
+
+                    {errorMessage && (
+                        <div className="page-rise rounded-xl border-2 border-black bg-[#FFF5F3] px-4 py-3 text-sm font-bold text-[#B42318]">
+                            {errorMessage}
                         </div>
                     )}
 

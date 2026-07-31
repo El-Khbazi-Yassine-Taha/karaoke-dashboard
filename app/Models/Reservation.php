@@ -21,6 +21,8 @@ class Reservation extends Model
         'check_out',
         'date',
         'status',
+        'cancel_source',
+        'cancelled_at',
         'calendly_uuid',
         'agenda_booking_id',
         'source',
@@ -31,6 +33,7 @@ class Reservation extends Model
         return [
             'check_in' => 'datetime',
             'check_out' => 'datetime',
+            'cancelled_at' => 'datetime',
             'date' => 'date',
             'members_count' => 'integer',
         ];

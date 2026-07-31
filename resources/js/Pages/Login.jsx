@@ -15,7 +15,7 @@ export default function Login() {
     return (
         <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-[#FFD400] px-4 py-10">
             <div
-                className="pointer-events-none fixed inset-0 z-0 opacity-20 waw-bg-drift"
+                className="pointer-events-none fixed inset-0 z-0 opacity-70 waw-bg-drift"
                 style={{
                     backgroundImage: `url("/images/bacground-waw.svg")`,
                     backgroundSize: 'cover',

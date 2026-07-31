@@ -64,7 +64,7 @@ export default function Users({ users = [], authUserId }) {
             <Head title="Manage users" />
 
             <div
-                className="pointer-events-none fixed inset-0 z-0 opacity-20 waw-bg-drift"
+                className="pointer-events-none fixed inset-0 z-0 opacity-70 waw-bg-drift"
                 style={{
                     backgroundImage: `url("/images/bacground-waw.svg")`,
                     backgroundSize: 'cover',

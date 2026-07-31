@@ -87,8 +87,31 @@ class StoreBookingRequest extends FormRequest
 
             $roomId = (int) $this->input('room_id');
 
+            // Even "Right now" / walk-ins cannot start a second live session in an occupied room.
+            $liveNow = Booking::query()
+                ->where('room_id', $roomId)
+                ->where('status', 'in_progress')
+                ->orderBy('end_time')
+                ->first();
+
+            if ($liveNow && $this->boolean('start_now')) {
+                // Stacking after the live guest is OK (confirmed for later) — only block
+                // if resolveTimes would put the new booking starting while they are still in.
+                if ($start->lt($liveNow->end_time)) {
+                    $minutesLeft = max(0, $now->diffInMinutes($liveNow->end_time, false));
+                    $validator->errors()->add('room_id', sprintf(
+                        'This room is occupied by %s until %s (%d min left). Check them out first, or book a later time.',
+                        $liveNow->client_name,
+                        $liveNow->end_time->format('H:i'),
+                        $minutesLeft
+                    ));
+                }
+
+                return;
+            }
+
             if ($this->boolean('start_now')) {
-                return; // stacking bypass, unchanged from before
+                return;
             }
 
             // 1. A room actually occupied right now (in_progress) can NEVER be shifted —

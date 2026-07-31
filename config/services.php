@@ -38,6 +38,7 @@ return [
     'agenda' => [
         'url' => env('AGENDA_API_URL', 'http://127.0.0.1:3000'),
         'key' => env('AGENDA_API_KEY'),
+        'pin' => env('AGENDA_ADMIN_PIN', 'waw2026'),
     ],
 
 ];

@@ -1,25 +1,82 @@
-import React, { useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { usePage, router } from '@inertiajs/react';
 
-export default function LiveAvailabilityHeader() {
+const TIME_ZONE = 'Africa/Casablanca';
+
+function useServerClock(serverTimestamp) {
+    const [now, setNow] = useState(() =>
+        serverTimestamp ? new Date(serverTimestamp * 1000) : new Date()
+    );
+
+    useEffect(() => {
+        const base = typeof serverTimestamp === 'number' ? serverTimestamp * 1000 : Date.now();
+        const offsetMs = base - Date.now();
+
+        const tick = () => setNow(new Date(Date.now() + offsetMs));
+        tick();
+        const id = window.setInterval(tick, 1000);
+        return () => window.clearInterval(id);
+    }, [serverTimestamp]);
+
+    return now;
+}
+
+function formatClock(date) {
+    const time = new Intl.DateTimeFormat('fr-MA', {
+        timeZone: TIME_ZONE,
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: false,
+    }).format(date);
+
+    const day = new Intl.DateTimeFormat('fr-MA', {
+        timeZone: TIME_ZONE,
+        weekday: 'short',
+        day: '2-digit',
+        month: 'short',
+    }).format(date);
+
+    return { time, day };
+}
+
+export default function LiveAvailabilityHeader({ serverTimestamp }) {
     const { auth } = usePage().props;
     const [menuOpen, setMenuOpen] = useState(false);
+    const now = useServerClock(serverTimestamp);
+    const { time, day } = useMemo(() => formatClock(now), [now]);
 
     const userName = auth?.user?.username || auth?.user?.name || 'Staff';
     const isAdmin = Boolean(auth?.user?.is_admin);
     const showRoleBadge = isAdmin && String(userName).toLowerCase() !== 'admin';
 
     return (
-        <header className="relative z-50 flex items-center justify-between gap-4 rounded-2xl border-2 border-black bg-[#FFFDF5] px-4 py-3 shadow-[3px_3px_0_#000] sm:px-5">
-            <a href="/dashboard" className="flex shrink-0 items-center">
+        <header className="relative z-50 grid grid-cols-[1fr_auto_1fr] items-center gap-3 rounded-2xl border-2 border-black bg-[#FFFDF5] px-4 py-2 shadow-[3px_3px_0_#000] sm:gap-4 sm:px-5 sm:py-2.5">
+            <a href="/dashboard" className="flex shrink-0 items-center justify-self-start">
                 <img
                     src="/images/waw-logo.png"
                     alt="WAW Karaoke"
-                    className="h-14 w-auto object-contain sm:h-16"
+                    className="h-[4.25rem] w-auto object-contain sm:h-[4.75rem]"
                 />
             </a>
 
-            <div className="relative z-50 shrink-0">
+            <div
+                className="flex flex-col items-center justify-center px-2 text-center"
+                title="Heure serveur (Casablanca)"
+                aria-live="polite"
+            >
+                <p className="text-[9px] font-semibold uppercase tracking-[0.16em] text-[#8A7400] sm:text-[10px]">
+                    Heure serveur
+                </p>
+                <p className="font-mono text-2xl font-black tabular-nums leading-none tracking-tight text-[#111] sm:text-3xl">
+                    {time}
+                </p>
+                <p className="mt-0.5 text-[10px] font-semibold capitalize text-[#6B6B6B] sm:text-[11px]">
+                    {day}
+                </p>
+            </div>
+
+            <div className="relative z-50 shrink-0 justify-self-end">
                 <button
                     type="button"
                     onClick={() => setMenuOpen(!menuOpen)}

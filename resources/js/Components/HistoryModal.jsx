@@ -321,14 +321,26 @@ export default function HistoryModal({ open, onClose }) {
                                                     No-show · not billed
                                                 </div>
                                             )}
+                                            {tab === 'cancelled' && (
+                                                <div className="mt-1 space-y-0.5">
+                                                    <div className="text-[10px] font-semibold uppercase tracking-wide text-[#B42318]">
+                                                        {item.cancelLabel ||
+                                                            (item.cancelSource === 'web'
+                                                                ? 'Cancelled on web'
+                                                                : 'Cancelled by staff')}
+                                                    </div>
+                                                    <div className="text-[10px] font-medium text-[#6B6B6B]">
+                                                        {item.bookedLabel ||
+                                                            (item.bookedVia === 'web'
+                                                                ? 'Booked online'
+                                                                : 'Booked at desk')}
+                                                        {item.cancelledAt ? ` · ${item.cancelledAt}` : ''}
+                                                    </div>
+                                                </div>
+                                            )}
                                         </div>
                                         <div className="text-right font-mono text-xs font-medium text-[#444]">
                                             {item.start} – {item.end}
-                                            {tab === 'cancelled' && item.cancelledAt && (
-                                                <div className="mt-1 font-sans text-[#B42318]">
-                                                    Cancelled {item.cancelledAt}
-                                                </div>
-                                            )}
                                             {tab === 'entered' && item.status === 'in_progress' && (
                                                 <div className="mt-1 font-sans text-[#8A7400]">
                                                     Currently in room
