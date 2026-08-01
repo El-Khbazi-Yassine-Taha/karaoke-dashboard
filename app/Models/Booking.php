@@ -34,6 +34,7 @@ class Booking extends Model
     protected $fillable = [
         'room_id',
         'client_name',
+        'client_phone',
         'members_count',
         'total_price',
         'start_time',

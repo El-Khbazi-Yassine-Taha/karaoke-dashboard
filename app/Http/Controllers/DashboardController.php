@@ -26,7 +26,7 @@ class DashboardController extends Controller
     {
         $this->syncAgendaQuietly();
 
-        $payload = array_merge($this->availability->getDashboardPayload(), [
+        $payload = array_merge($this->availability->getDashboardPayload(true), [
             'reservations' => $this->reservationsPayload(),
         ]);
 
@@ -38,9 +38,8 @@ class DashboardController extends Controller
      */
     public function status(): JsonResponse
     {
-        $this->syncAgendaQuietly();
-
-        $payload = array_merge($this->availability->getDashboardPayload(), [
+        // Polls must stay fast — skip agenda sync + schedule repair (mutations already repair).
+        $payload = array_merge($this->availability->getDashboardPayload(false), [
             'reservations' => $this->reservationsPayload(),
         ]);
 
@@ -112,14 +111,15 @@ class DashboardController extends Controller
 
     private function syncAgendaQuietly(): void
     {
-        try {
-            Cache::remember('agenda-sync-throttle', 10, function () {
-                $this->agenda->syncReservations();
-
-                return true;
-            });
-        } catch (\Throwable) {
-            // Keep dashboard usable if agenda is offline
+        // Never block the dashboard HTML/JSON on Vercel — sync after the response.
+        if (Cache::has('agenda-sync-throttle')) {
+            return;
         }
+
+        Cache::put('agenda-sync-throttle', true, 45);
+
+        $this->agenda->defer(function (AgendaClient $agenda) {
+            $agenda->syncReservations();
+        });
     }
 }

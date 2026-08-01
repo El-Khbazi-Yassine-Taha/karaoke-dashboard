@@ -11,15 +11,19 @@ use Illuminate\Support\Facades\Log;
 
 class RoomAvailabilityService
 {
-    public function getDashboardPayload(): array
+    public function getDashboardPayload(bool $repairSchedules = true): array
     {
         $now = Carbon::now();
         $rooms = Room::query()->orderBy('name')->get();
 
-        $this->healExpiredSessions($now);
-        $this->processNoShows($now);
+        // Throttle housekeeping so rapid clicks / polls don't re-scan every time
+        if (! \Illuminate\Support\Facades\Cache::has('desk-housekeep-throttle')) {
+            \Illuminate\Support\Facades\Cache::put('desk-housekeep-throttle', true, 20);
+            $this->healExpiredSessions($now);
+            $this->processNoShows($now);
+        }
 
-        $roomPayloads = $rooms->map(fn (Room $room) => $this->getRoomStatus($room, $now));
+        $roomPayloads = $rooms->map(fn (Room $room) => $this->getRoomStatus($room, $now, $repairSchedules));
 
         $today = Carbon::today();
         $dailyRevenue = Booking::whereDate('start_time', $today)
@@ -64,7 +68,22 @@ class RoomAvailabilityService
             ->where('end_time', '<=', $now)
             ->each(function (Booking $booking) {
                 $booking->update(['status' => 'completed']);
-                $this->releaseAgendaBlocksFromNotes((string) $booking->notes);
+                $notes = (string) $booking->notes;
+                app(AgendaClient::class)->defer(function (AgendaClient $agenda) use ($notes) {
+                    // Inline release to avoid controller coupling
+                    $ids = [];
+                    if (preg_match('/agenda-blocks:([a-f0-9\-,]+)/i', $notes, $m)) {
+                        foreach (explode(',', $m[1]) as $id) {
+                            $id = trim($id);
+                            if ($id !== '') {
+                                $ids[] = $id;
+                            }
+                        }
+                    }
+                    if ($ids !== []) {
+                        $agenda->releaseSlots(array_values(array_unique($ids)));
+                    }
+                });
             });
     }
 
@@ -87,7 +106,21 @@ class RoomAvailabilityService
                     'payment_method' => null,
                 ]);
 
-                $this->releaseAgendaBlocksFromNotes((string) $booking->notes);
+                $notes = (string) $booking->notes;
+                app(AgendaClient::class)->defer(function (AgendaClient $agenda) use ($notes) {
+                    $ids = [];
+                    if (preg_match('/agenda-blocks:([a-f0-9\-,]+)/i', $notes, $m)) {
+                        foreach (explode(',', $m[1]) as $id) {
+                            $id = trim($id);
+                            if ($id !== '') {
+                                $ids[] = $id;
+                            }
+                        }
+                    }
+                    if ($ids !== []) {
+                        $agenda->releaseSlots(array_values(array_unique($ids)));
+                    }
+                });
             });
 
         Reservation::query()
@@ -109,10 +142,10 @@ class RoomAvailabilityService
                 ]);
 
                 if ($res->agenda_booking_id) {
-                    app(AgendaClient::class)->updateCheckInStatus(
-                        (string) $res->agenda_booking_id,
-                        'no_show'
-                    );
+                    $agendaId = (string) $res->agenda_booking_id;
+                    app(AgendaClient::class)->defer(function (AgendaClient $agenda) use ($agendaId) {
+                        $agenda->updateCheckInStatus($agendaId, 'no_show');
+                    });
                 }
             });
     }
@@ -138,9 +171,11 @@ class RoomAvailabilityService
         }
     }
 
-    public function getRoomStatus(Room $room, Carbon $now): array
+    public function getRoomStatus(Room $room, Carbon $now, bool $repairSchedule = true): array
     {
-        \App\Http\Controllers\BookingController::repairRoomSchedule($room->id);
+        if ($repairSchedule) {
+            \App\Http\Controllers\BookingController::repairRoomSchedule($room->id);
+        }
 
         $startOfDay = (clone $now)->startOfDay();
         $endOfDay = (clone $now)->endOfDay();
@@ -161,13 +196,16 @@ class RoomAvailabilityService
             return $start->lte($now) && $end->gt($now);
         });
 
-        // Desk walk-in waiting for payment (timer not started)
-        $awaitingPayment = $bookings->first(function ($b) use ($current) {
+        // Desk walk-in waiting for payment (timer not started) — only once start time is due
+        $awaitingPayment = $bookings->first(function ($b) use ($current, $now) {
             if ($current && $b->id === $current->id) {
                 return false;
             }
+            if ($b->status !== 'pending') {
+                return false;
+            }
 
-            return $b->status === 'pending';
+            return Carbon::parse($b->start_time)->lte($now);
         });
 
         $awaitingCheckIn = $bookings->first(function ($b) use ($now, $current, $awaitingPayment) {
@@ -244,6 +282,7 @@ class RoomAvailabilityService
             ->map(fn (Reservation $res) => [
                 'id' => 'web-'.$res->id,
                 'clientName' => 'Web · '.$res->client_name,
+                'clientPhone' => $res->client_phone,
                 'paid' => ($res->payment_status ?? '') === 'paid',
                 'paymentMethod' => null,
                 'isComplimentary' => false,
@@ -276,6 +315,7 @@ class RoomAvailabilityService
                 'capacity' => $room->capacity,
                 'state' => 'occupied',
                 'currentClient' => $current->client_name,
+                'currentClientPhone' => $current->client_phone,
                 'currentClientPaid' => (bool) $current->paid,
                 'paymentMethod' => $current->payment_method,
                 'isComplimentary' => (bool) $current->is_complimentary,
@@ -310,6 +350,7 @@ class RoomAvailabilityService
                 'capacity' => $room->capacity,
                 'state' => 'awaiting_payment',
                 'currentClient' => $isWeb ? $dueWeb->client_name : $guest->client_name,
+                'currentClientPhone' => $isWeb ? $dueWeb->client_phone : $guest->client_phone,
                 'currentClientPaid' => false,
                 'paymentMethod' => null,
                 'isComplimentary' => $isWeb ? false : (bool) $guest->is_complimentary,
@@ -358,6 +399,7 @@ class RoomAvailabilityService
             'freeForSeconds' => $freeForSecsOnly,
             'nextClient' => $next?->client_name ?? ($nextWeb['clientName'] ?? null),
             'nextStart' => $nextStart?->format('H:i'),
+            'nextStartIso' => $nextStart?->toIso8601String(),
             'bookingId' => null,
             'reservationId' => null,
             'awaitingCheckIn' => $awaitingCheckIn ? $this->formatBooking($awaitingCheckIn) : null,
@@ -387,6 +429,7 @@ class RoomAvailabilityService
         return [
             'id' => $booking->id,
             'clientName' => $booking->client_name,
+            'clientPhone' => $booking->client_phone,
             'paid' => (bool) $booking->paid,
             'paymentMethod' => $booking->payment_method,
             'isComplimentary' => (bool) $booking->is_complimentary,

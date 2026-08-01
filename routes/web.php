@@ -34,9 +34,11 @@ Route::middleware('auth')->group(function () {
     Route::post('/bookings/{booking}/delay', [BookingController::class, 'delay'])->name('bookings.delay');
     Route::post('/bookings/{booking}/update', [BookingController::class, 'update'])->name('bookings.update');
     Route::post('/bookings/{booking}/extend', [BookingController::class, 'extend'])->name('bookings.extend');
+    Route::post('/bookings/{booking}/switch-room', [BookingController::class, 'switchRoom'])->name('bookings.switchRoom');
     Route::post('/bookings/{booking}/cancel', [BookingController::class, 'cancel'])->name('bookings.cancel');
 
     Route::post('/reservations/{reservation}/update', [ReservationController::class, 'update'])->name('reservations.update');
+    Route::post('/reservations/{reservation}/switch-room', [ReservationController::class, 'switchRoom'])->name('reservations.switchRoom');
     Route::post('/reservations/{reservation}/cancel', [ReservationController::class, 'cancel'])->name('reservations.cancel');
     Route::post('/reservations/{reservation}/start-session', [ReservationController::class, 'startSession'])->name('reservations.startSession');
     Route::post('/reservations/{reservation}/no-show', [ReservationController::class, 'markNoShow'])->name('reservations.noShow');

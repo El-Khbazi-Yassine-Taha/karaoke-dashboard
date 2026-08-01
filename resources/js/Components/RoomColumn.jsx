@@ -1,7 +1,27 @@
-import { useState, useEffect, useLayoutEffect, useRef } from 'react';
+import { useState, useEffect, useLayoutEffect, useRef, useMemo } from 'react';
 import { createPortal } from 'react-dom';
 import { router } from '@inertiajs/react';
 import SessionRingTimer from './SessionRingTimer';
+import { deskVisit } from '../lib/deskVisit';
+
+function localDateStr() {
+    const n = new Date();
+    const y = n.getFullYear();
+    const m = String(n.getMonth() + 1).padStart(2, '0');
+    const d = String(n.getDate()).padStart(2, '0');
+    return `${y}-${m}-${d}`;
+}
+
+/** Parse today's HH:mm in local time (avoid UTC date from toISOString). */
+function parseLocalTodayTime(hhmm, iso = null) {
+    if (iso) {
+        const t = new Date(iso).getTime();
+        if (!Number.isNaN(t)) return t;
+    }
+    if (!hhmm) return NaN;
+    const raw = String(hhmm).length === 5 ? `${hhmm}:00` : String(hhmm);
+    return new Date(`${localDateStr()}T${raw}`).getTime();
+}
 
 let sharedAudioCtx = null;
 let continuousAlarmTimer = null;
@@ -278,7 +298,8 @@ function OverflowMenu({ open, onToggle, items }) {
     );
 }
 
-export default function RoomColumn({ room, onOpenBooking }) {
+export default function RoomColumn({ room, rooms = [], onOpenBooking }) {
+    const otherRoom = (rooms || []).find((r) => String(r.id) !== String(room.id));
     const isOccupied = room.state === 'occupied';
     const isAwaitingPayment = room.state === 'awaiting_payment' || Boolean(room.awaitingPayment);
 
@@ -352,7 +373,7 @@ export default function RoomColumn({ room, onOpenBooking }) {
         // Web reservation due → create booking + start timer after payment choice
         if (isAwaitingPayment && room.reservationId) {
             router.post(`/reservations/${room.reservationId}/start-session`, payload, {
-                preserveScroll: true,
+                ...deskVisit,
             });
             return;
         }
@@ -360,13 +381,13 @@ export default function RoomColumn({ room, onOpenBooking }) {
         // Local walk-in pending payment → start timer after payment choice
         if (isAwaitingPayment && room.bookingId) {
             router.post(`/bookings/${room.bookingId}/start-session`, payload, {
-                preserveScroll: true,
+                ...deskVisit,
             });
             return;
         }
 
         if (!room.bookingId) return;
-        router.post(`/bookings/${room.bookingId}/toggle-paid`, payload, { preserveScroll: true });
+        router.post(`/bookings/${room.bookingId}/toggle-paid`, payload, deskVisit);
     }
 
     function openMarkPaid(bookingId) {
@@ -385,7 +406,7 @@ export default function RoomColumn({ room, onOpenBooking }) {
         router.post(
             `/bookings/${id}/toggle-paid`,
             { paid: 1, payment_method: method },
-            { preserveScroll: true }
+            deskVisit
         );
     }
 
@@ -393,7 +414,7 @@ export default function RoomColumn({ room, onOpenBooking }) {
         if (!/^\d+$/.test(String(bookingId))) return;
         const isCurrent = String(bookingId) === String(room.bookingId);
         if (isCurrent) setLocalPaid(false);
-        router.post(`/bookings/${bookingId}/toggle-paid`, { paid: 0 }, { preserveScroll: true });
+        router.post(`/bookings/${bookingId}/toggle-paid`, { paid: 0 }, deskVisit);
     }
 
     function checkIn(bookingId) {
@@ -433,7 +454,7 @@ export default function RoomColumn({ room, onOpenBooking }) {
         setUnpaidConfirmStep(false);
         setPaymentMethodPick(null);
 
-        router.post(`/bookings/${id}/start-session`, payload, { preserveScroll: true });
+        router.post(`/bookings/${id}/start-session`, payload, deskVisit);
     }
 
     function closeCheckInPayment() {
@@ -492,25 +513,72 @@ export default function RoomColumn({ room, onOpenBooking }) {
         });
     }
 
+    function switchBookingRoom(bookingId, clientName = 'Guest') {
+        if (!otherRoom?.id || !/^\d+$/.test(String(bookingId))) return;
+        setOpenMenu(null);
+        setActionConfirm({
+            type: 'switch_room',
+            kind: 'booking',
+            id: String(bookingId),
+            name: clientName,
+            targetRoomId: otherRoom.id,
+            targetRoomName: otherRoom.name,
+        });
+    }
+
+    function switchReservationRoom(item) {
+        const id = reservationNumericId(item);
+        if (!id || !otherRoom?.id) return;
+        setOpenMenu(null);
+        let name = item.clientName || 'Guest';
+        if (typeof name === 'string' && name.startsWith('Web · ')) {
+            name = name.slice(6);
+        }
+        setActionConfirm({
+            type: 'switch_room',
+            kind: 'reservation',
+            id: String(id),
+            name,
+            targetRoomId: otherRoom.id,
+            targetRoomName: otherRoom.name,
+        });
+    }
+
     function runActionConfirm() {
         if (!actionConfirm) return;
-        const { type, kind, id } = actionConfirm;
+        const { type, kind, id, targetRoomId } = actionConfirm;
         setActionConfirm(null);
 
         if (type === 'no_show' && kind === 'booking') {
-            router.post(`/bookings/${id}/no-show`, {}, { preserveScroll: true });
+            router.post(`/bookings/${id}/no-show`, {}, deskVisit);
             return;
         }
         if (type === 'no_show' && kind === 'reservation') {
-            router.post(`/reservations/${id}/no-show`, {}, { preserveScroll: true });
+            router.post(`/reservations/${id}/no-show`, {}, deskVisit);
             return;
         }
         if (type === 'cancel' && kind === 'booking') {
-            router.post(`/bookings/${id}/cancel`, {}, { preserveScroll: true });
+            router.post(`/bookings/${id}/cancel`, {}, deskVisit);
             return;
         }
         if (type === 'cancel' && kind === 'reservation') {
-            router.post(`/reservations/${id}/cancel`, {}, { preserveScroll: true });
+            router.post(`/reservations/${id}/cancel`, {}, deskVisit);
+            return;
+        }
+        if (type === 'switch_room' && kind === 'booking' && targetRoomId) {
+            router.post(
+                `/bookings/${id}/switch-room`,
+                { room_id: targetRoomId },
+                deskVisit
+            );
+            return;
+        }
+        if (type === 'switch_room' && kind === 'reservation' && targetRoomId) {
+            router.post(
+                `/reservations/${id}/switch-room`,
+                { room_id: targetRoomId },
+                deskVisit
+            );
         }
     }
 
@@ -521,8 +589,8 @@ export default function RoomColumn({ room, onOpenBooking }) {
 
     const [msFreeRemaining, setMsFreeRemaining] = useState(() => {
         if (isOccupied || !room.nextStart) return 0;
-        const nextStartTime = new Date(`${new Date().toISOString().split('T')[0]}T${room.nextStart}`);
-        return Math.max(0, nextStartTime.getTime() - Date.now());
+        const t = parseLocalTodayTime(room.nextStart, room.nextStartIso);
+        return Number.isNaN(t) ? 0 : Math.max(0, t - Date.now());
     });
 
     useEffect(() => {
@@ -533,7 +601,7 @@ export default function RoomColumn({ room, onOpenBooking }) {
         const targetTime = new Date(room.checkoutTimeIso).getTime();
         const updateTimer = () => setMsRemaining(Math.max(0, targetTime - Date.now()));
         updateTimer();
-        const interval = setInterval(updateTimer, 1000);
+        const interval = setInterval(updateTimer, 250);
         return () => clearInterval(interval);
     }, [isOccupied, room.checkoutTimeIso]);
 
@@ -542,16 +610,40 @@ export default function RoomColumn({ room, onOpenBooking }) {
             setMsFreeRemaining(0);
             return;
         }
-        const nextStartTime = new Date(`${new Date().toISOString().split('T')[0]}T${room.nextStart}`);
-        const updateFreeTimer = () => setMsFreeRemaining(Math.max(0, nextStartTime.getTime() - Date.now()));
+        const targetTime = parseLocalTodayTime(room.nextStart, room.nextStartIso);
+        if (Number.isNaN(targetTime)) {
+            setMsFreeRemaining(0);
+            return;
+        }
+        const updateFreeTimer = () => setMsFreeRemaining(Math.max(0, targetTime - Date.now()));
         updateFreeTimer();
-        const interval = setInterval(updateFreeTimer, 1000);
+        const interval = setInterval(updateFreeTimer, 250);
         return () => clearInterval(interval);
-    }, [isOccupied, room.nextStart]);
+    }, [isOccupied, room.nextStart, room.nextStartIso]);
 
     const secondsLeft = Math.floor(msRemaining / 1000);
     const showUrgentAlert =
         isOccupied && secondsLeft <= 60 && !paymentConfirmOpen && !checkoutConfirmOpen && !actionConfirm;
+
+    // Optimistic due-guest UI handles handoff — do NOT auto-reload here (caused yellow blank page).
+    const prevFreeMsRef = useRef(null);
+    useEffect(() => {
+        prevFreeMsRef.current = msFreeRemaining;
+    }, [msFreeRemaining]);
+
+    // When live session countdown hits 0, check out once (not if already 0 on first paint)
+    const autoCheckoutFiredForBooking = useRef(null);
+    const prevSecondsLeftRef = useRef(null);
+    useEffect(() => {
+        const prev = prevSecondsLeftRef.current;
+        prevSecondsLeftRef.current = secondsLeft;
+
+        if (!isOccupied || !room.bookingId || secondsLeft > 0) return;
+        if (prev == null || prev <= 0) return;
+        if (autoCheckoutFiredForBooking.current === room.bookingId) return;
+        autoCheckoutFiredForBooking.current = room.bookingId;
+        router.post(`/bookings/${room.bookingId}/checkout`, {}, deskVisit);
+    }, [isOccupied, room.bookingId, secondsLeft]);
 
     useEffect(() => {
         if (showUrgentAlert) {
@@ -583,18 +675,6 @@ export default function RoomColumn({ room, onOpenBooking }) {
         };
     }, [showUrgentAlert, room.name]);
 
-    const autoCheckoutFiredForBooking = useRef(null);
-
-    useEffect(() => {
-        if (!isOccupied || !room.bookingId || secondsLeft > 0) return;
-        if (autoCheckoutFiredForBooking.current === room.bookingId) return;
-        autoCheckoutFiredForBooking.current = room.bookingId;
-        const timeoutId = setTimeout(() => {
-            router.post(`/bookings/${room.bookingId}/checkout`, {}, { preserveScroll: true });
-        }, 5000);
-        return () => clearTimeout(timeoutId);
-    }, [isOccupied, room.bookingId, secondsLeft]);
-
     function checkoutNow() {
         if (!room.bookingId) return;
         setCheckoutConfirmOpen(true);
@@ -604,7 +684,7 @@ export default function RoomColumn({ room, onOpenBooking }) {
     function confirmCheckout() {
         if (!room.bookingId) return;
         setCheckoutConfirmOpen(false);
-        router.post(`/bookings/${room.bookingId}/checkout`, {}, { preserveScroll: true });
+        router.post(`/bookings/${room.bookingId}/checkout`, {}, deskVisit);
     }
 
     function togglePaid(bookingId, nextPaid = null) {
@@ -619,7 +699,7 @@ export default function RoomColumn({ room, onOpenBooking }) {
 
     function pushBooking(bookingId, minutes) {
         if (!/^\d+$/.test(String(bookingId))) return;
-        router.post(`/bookings/${bookingId}/delay`, { minutes }, { preserveScroll: true });
+        router.post(`/bookings/${bookingId}/delay`, { minutes }, deskVisit);
     }
 
     function openEditModal() {
@@ -651,7 +731,7 @@ export default function RoomColumn({ room, onOpenBooking }) {
         router.post(
             `/bookings/${room.bookingId}/extend`,
             { minutes },
-            { preserveScroll: true }
+            deskVisit
         );
     }
 
@@ -680,7 +760,7 @@ export default function RoomColumn({ room, onOpenBooking }) {
                 start_clock_time: editStartTime,
                 duration_minutes: editDuration,
             },
-            { preserveScroll: true, onSuccess: () => setIsEditingActive(false) }
+            { ...deskVisit, onSuccess: () => setIsEditingActive(false) }
         );
     }
 
@@ -688,15 +768,16 @@ export default function RoomColumn({ room, onOpenBooking }) {
         e.preventDefault();
         if (!editingBooking?.id) return;
 
+        const mins = Math.max(0, Math.min(100, Number(editBookingDuration) || 0));
         const payload = {
             client_name: editBookingName,
             start_clock_time: editBookingStartTime,
-            duration_minutes: editBookingDuration,
+            duration_minutes: mins,
         };
 
         if (isDeskBooking(editingBooking)) {
             router.post(`/bookings/${editingBooking.id}/update`, payload, {
-                preserveScroll: true,
+                ...deskVisit,
                 onSuccess: () => setEditingBooking(null),
             });
             return;
@@ -706,7 +787,7 @@ export default function RoomColumn({ room, onOpenBooking }) {
         if (!reservationId) return;
 
         router.post(`/reservations/${reservationId}/update`, payload, {
-            preserveScroll: true,
+            ...deskVisit,
             onSuccess: () => setEditingBooking(null),
         });
     }
@@ -728,31 +809,59 @@ export default function RoomColumn({ room, onOpenBooking }) {
     const freeSecs = Math.floor((msFreeRemaining % 60000) / 1000);
     const freeDurationFormatted = `${freeMins}m ${freeSecs}s`;
 
-    const upcomingQueue = room.upcoming
-        ? room.upcoming.filter((b) => {
-              const isCurrentActive = room.bookingId && String(b.id) === String(room.bookingId);
-              const status = (b.status || '').toLowerCase();
-              // Keep future in_progress rows visible (e.g. session edited to start later)
-              return (
-                  !isCurrentActive &&
-                  status !== 'completed' &&
-                  status !== 'cancelled' &&
-                  status !== 'no_show'
-              );
-          })
-        : [];
+    const upcomingQueue = useMemo(() => {
+        if (!room.upcoming) return [];
+        return room.upcoming.filter((b) => {
+            const isCurrentActive = room.bookingId && String(b.id) === String(room.bookingId);
+            const status = (b.status || '').toLowerCase();
+            return (
+                !isCurrentActive &&
+                status !== 'completed' &&
+                status !== 'cancelled' &&
+                status !== 'no_show'
+            );
+        });
+    }, [room.upcoming, room.bookingId]);
 
     const currentMembers = room.members || 1;
     const currentPrice = isComplimentary ? 0 : calculatePrice(currentMembers);
     const methodLabel = paymentLabel(paymentMethod, isComplimentary);
-    const awaiting = room.awaitingCheckIn || null;
+
+    // At next-start time, promote first local guest immediately (don't wait for 60s poll)
+    const optimisticDue = useMemo(() => {
+        if (isOccupied || isAwaitingPayment || room.awaitingCheckIn) return null;
+        if (msFreeRemaining > 1000) return null;
+        const next = upcomingQueue[0];
+        if (!next || !/^\d+$/.test(String(next.id))) return null;
+        if (room.nextStart && next.start && next.start !== room.nextStart) return null;
+        return next;
+    }, [
+        isOccupied,
+        isAwaitingPayment,
+        room.awaitingCheckIn,
+        room.nextStart,
+        msFreeRemaining,
+        upcomingQueue,
+    ]);
+
+    const awaiting = room.awaitingCheckIn || optimisticDue || null;
+    const showDueCheckIn = Boolean(awaiting) && !isOccupied && !isAwaitingPayment;
+
+    const displayUpcoming = useMemo(() => {
+        if (!awaiting) return upcomingQueue;
+        return upcomingQueue.filter((b) => String(b.id) !== String(awaiting.id));
+    }, [upcomingQueue, awaiting]);
 
     return (
         <div className="relative flex h-full flex-col overflow-hidden rounded-2xl border-2 border-black bg-white">
             {actionConfirm && (
                 <div className="absolute inset-0 z-[75] flex flex-col items-center justify-center bg-[#FFFDF5] p-6 text-center">
                     <p className="mb-1 text-[11px] font-bold uppercase tracking-wider text-black/40">
-                        {actionConfirm.type === 'no_show' ? 'No-show' : 'Cancel'}
+                        {actionConfirm.type === 'no_show'
+                            ? 'No-show'
+                            : actionConfirm.type === 'switch_room'
+                              ? 'Switch room'
+                              : 'Cancel'}
                     </p>
                     <h4 className="mb-2 text-xl font-black text-black">{room.name}</h4>
                     <p className="mb-1 text-lg font-bold capitalize text-black">
@@ -761,7 +870,9 @@ export default function RoomColumn({ room, onOpenBooking }) {
                     <p className="mb-6 text-sm font-semibold text-black/55">
                         {actionConfirm.type === 'no_show'
                             ? 'Guest did not arrive — will not count as paid.'
-                            : 'Cancel this reservation?'}
+                            : actionConfirm.type === 'switch_room'
+                              ? `Move to ${actionConfirm.targetRoomName || 'the other room'}?`
+                              : 'Cancel this reservation?'}
                     </p>
                     <div className="flex w-full max-w-xs gap-2">
                         <button
@@ -776,7 +887,11 @@ export default function RoomColumn({ room, onOpenBooking }) {
                             onClick={runActionConfirm}
                             className="btn-waw flex-1"
                         >
-                            {actionConfirm.type === 'no_show' ? 'Yes, no-show' : 'Yes, cancel'}
+                            {actionConfirm.type === 'no_show'
+                                ? 'Yes, no-show'
+                                : actionConfirm.type === 'switch_room'
+                                  ? 'Yes, switch'
+                                  : 'Yes, cancel'}
                         </button>
                     </div>
                 </div>
@@ -1186,6 +1301,20 @@ export default function RoomColumn({ room, onOpenBooking }) {
                                               ? methodLabel || 'Paid'
                                               : 'Unpaid'}
                                     </span>
+                                    {room.currentClientPhone ? (
+                                        <a
+                                            href={`tel:${String(room.currentClientPhone).replace(/\s+/g, '')}`}
+                                            className="inline-flex items-center gap-1.5 text-black hover:underline"
+                                            title="Call guest"
+                                        >
+                                            <MetaIcon>
+                                                <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2">
+                                                    <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.13.81.36 1.6.7 2.34a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.74.34 1.53.57 2.34.7A2 2 0 0 1 22 16.92z" />
+                                                </svg>
+                                            </MetaIcon>
+                                            {room.currentClientPhone}
+                                        </a>
+                                    ) : null}
                                 </div>
                             </div>
 
@@ -1210,6 +1339,18 @@ export default function RoomColumn({ room, onOpenBooking }) {
                                     }
                                     items={[
                                         { label: 'Edit session', onClick: openEditModal },
+                                        ...(otherRoom
+                                            ? [
+                                                  {
+                                                      label: `Switch to ${otherRoom.name}`,
+                                                      onClick: () =>
+                                                          switchBookingRoom(
+                                                              room.bookingId,
+                                                              room.currentClient || 'Guest'
+                                                          ),
+                                                  },
+                                              ]
+                                            : []),
                                         {
                                             label: 'No-show',
                                             danger: true,
@@ -1235,6 +1376,36 @@ export default function RoomColumn({ room, onOpenBooking }) {
                                 : 'Waiting for payment — timer not started'}
                         </p>
                     </div>
+                ) : showDueCheckIn ? (
+                    <div className="mb-4 rounded-2xl border-2 border-black bg-[#FFF5F3] px-4 py-6 text-center">
+                        <p className="text-[10px] font-black uppercase tracking-wide text-[#B42318]">
+                            Session due now
+                        </p>
+                        <p className="mt-1 text-[15px] font-black capitalize text-black">
+                            {awaiting.clientName}
+                        </p>
+                        <p className="mt-1 text-[13px] font-semibold text-black/50">
+                            Reserved {awaiting.start}–{awaiting.end}
+                        </p>
+                        <div className="mt-3 flex gap-2">
+                            <button
+                                type="button"
+                                onClick={() => checkIn(awaiting.id)}
+                                className="btn-waw flex-1 text-[12px]"
+                            >
+                                Check in
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() =>
+                                    markNoShow(awaiting.id, awaiting.clientName || 'Guest')
+                                }
+                                className="btn-waw-ghost flex-1 text-[12px]"
+                            >
+                                No-show
+                            </button>
+                        </div>
+                    </div>
                 ) : (
                     <div className="mb-4 rounded-2xl border-2 border-dashed border-black/25 bg-[#F7F4EC] px-4 py-8 text-center">
                         <p className="text-[15px] font-black text-black">Room free</p>
@@ -1246,7 +1417,7 @@ export default function RoomColumn({ room, onOpenBooking }) {
                     </div>
                 )}
 
-                {awaiting && (
+                {awaiting && !showDueCheckIn && (
                     <div className="mb-4 rounded-xl border-2 border-black bg-[#FFF5F3] px-3 py-3">
                         <p className="text-[10px] font-black uppercase tracking-wide text-[#B42318]">
                             Waiting for check-in
@@ -1315,8 +1486,8 @@ export default function RoomColumn({ room, onOpenBooking }) {
                         Up next
                     </p>
                     <div className="space-y-2">
-                        {upcomingQueue.length > 0 ? (
-                            upcomingQueue.map((b) => {
+                        {displayUpcoming.length > 0 ? (
+                            displayUpcoming.map((b) => {
                                 const origTime = (b.originalStart || b.original_start)
                                     ? new Date(`1970-01-01T${b.originalStart || b.original_start}`)
                                     : null;
@@ -1340,6 +1511,18 @@ export default function RoomColumn({ room, onOpenBooking }) {
                                           ...(!isOccupied
                                               ? [{ label: 'Check in', onClick: () => checkIn(b.id) }]
                                               : []),
+                                          ...(otherRoom
+                                              ? [
+                                                    {
+                                                        label: `Switch to ${otherRoom.name}`,
+                                                        onClick: () =>
+                                                            switchBookingRoom(
+                                                                b.id,
+                                                                b.clientName || 'Guest'
+                                                            ),
+                                                    },
+                                                ]
+                                              : []),
                                           {
                                               label: 'No-show',
                                               danger: true,
@@ -1356,6 +1539,14 @@ export default function RoomColumn({ room, onOpenBooking }) {
                                     : webReservation
                                       ? [
                                             { label: 'Edit', onClick: () => openEditBookingModal(b) },
+                                            ...(otherRoom
+                                                ? [
+                                                      {
+                                                          label: `Switch to ${otherRoom.name}`,
+                                                          onClick: () => switchReservationRoom(b),
+                                                      },
+                                                  ]
+                                                : []),
                                             {
                                                 label: 'No-show',
                                                 danger: true,
@@ -1421,6 +1612,15 @@ export default function RoomColumn({ room, onOpenBooking }) {
                                                           ? bookingMethod || 'Paid'
                                                           : 'Unpaid'}
                                                 </span>
+                                                {b.clientPhone ? (
+                                                    <a
+                                                        href={`tel:${String(b.clientPhone).replace(/\s+/g, '')}`}
+                                                        className="ml-1 text-black hover:underline"
+                                                        onClick={(e) => e.stopPropagation()}
+                                                    >
+                                                        · {b.clientPhone}
+                                                    </a>
+                                                ) : null}
                                             </p>
                                         </div>
 
@@ -1505,7 +1705,33 @@ export default function RoomColumn({ room, onOpenBooking }) {
                                             {m}m
                                         </button>
                                     ))}
+                                    <input
+                                        type="number"
+                                        min={0}
+                                        max={100}
+                                        step={1}
+                                        placeholder="0–100"
+                                        value={
+                                            [30, 60, 90, 120, 150, 180].includes(Number(editDuration))
+                                                ? ''
+                                                : editDuration
+                                        }
+                                        onChange={(e) => {
+                                            const v = e.target.value;
+                                            if (v === '') {
+                                                setEditDuration('');
+                                                return;
+                                            }
+                                            const n = parseInt(v, 10);
+                                            if (!Number.isFinite(n)) return;
+                                            setEditDuration(Math.max(0, Math.min(100, n)));
+                                        }}
+                                        className="w-[7.5rem] rounded-lg border-2 border-black bg-white px-2 py-1.5 text-xs font-bold text-black outline-none focus:bg-[#FFD400]/30"
+                                    />
                                 </div>
+                                <p className="mt-1.5 text-[11px] font-semibold text-black/45">
+                                    Or type any minutes (0–100)
+                                </p>
                                 <p className="mt-2 text-[12px] font-bold text-black">
                                     Ends at{' '}
                                     <span className="tabular-nums text-[#8A7400]">
@@ -1557,14 +1783,14 @@ export default function RoomColumn({ room, onOpenBooking }) {
                             </div>
                             <div>
                                 <label className="mb-2 block text-[12px] font-bold text-black/50">Duration</label>
-                                <div className="flex gap-2">
+                                <div className="flex flex-wrap gap-2">
                                     {[30, 60, 90, 120].map((m) => (
                                         <button
                                             key={m}
                                             type="button"
                                             onClick={() => setEditBookingDuration(m)}
                                             className={`rounded-lg border-2 border-black px-3 py-1.5 text-xs font-bold ${
-                                                editBookingDuration === m
+                                                Number(editBookingDuration) === m
                                                     ? 'bg-[#FFD400] text-black'
                                                     : 'bg-white text-black'
                                             }`}
@@ -1572,7 +1798,33 @@ export default function RoomColumn({ room, onOpenBooking }) {
                                             {m}m
                                         </button>
                                     ))}
+                                    <input
+                                        type="number"
+                                        min={0}
+                                        max={100}
+                                        step={1}
+                                        placeholder="0–100"
+                                        value={
+                                            [30, 60, 90, 120].includes(Number(editBookingDuration))
+                                                ? ''
+                                                : editBookingDuration
+                                        }
+                                        onChange={(e) => {
+                                            const v = e.target.value;
+                                            if (v === '') {
+                                                setEditBookingDuration('');
+                                                return;
+                                            }
+                                            const n = parseInt(v, 10);
+                                            if (!Number.isFinite(n)) return;
+                                            setEditBookingDuration(Math.max(0, Math.min(100, n)));
+                                        }}
+                                        className="w-[7.5rem] rounded-lg border-2 border-black bg-white px-2 py-1.5 text-xs font-bold text-black outline-none focus:bg-[#FFD400]/30"
+                                    />
                                 </div>
+                                <p className="mt-1.5 text-[11px] font-semibold text-black/45">
+                                    Or type any minutes (0–100)
+                                </p>
                             </div>
                             <div className="flex gap-2 pt-2">
                                 <button

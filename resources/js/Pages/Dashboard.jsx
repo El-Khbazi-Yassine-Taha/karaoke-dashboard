@@ -6,6 +6,8 @@ import RoomColumn from '../Components/RoomColumn';
 import HistoryModal from '../Components/HistoryModal';
 import KaraokeBackground from '../Components/KaraokeBackground';
 import AgendaView from '@/Components/AgendaView';
+import ErrorBoundary from '../Components/ErrorBoundary';
+import { DASHBOARD_ONLY } from '../lib/deskVisit';
 
 export default function Dashboard({
     rooms = [],
@@ -24,22 +26,15 @@ export default function Dashboard({
         errors?.check_in || errors?.start || errors?.room_id || errors?.booking || null;
 
     useEffect(() => {
-        const interval = window.setInterval(async () => {
+        const interval = window.setInterval(() => {
             try {
-                const response = await fetch('/dashboard/status', {
-                    headers: {
-                        Accept: 'application/json',
-                        'X-Requested-With': 'XMLHttpRequest',
-                    },
-                });
-                if (!response.ok) return;
                 router.reload({
-                    only: ['rooms', 'summary', 'serverTime', 'serverTimestamp', 'reservations'],
+                    only: DASHBOARD_ONLY,
                     preserveScroll: true,
                     preserveState: true,
                 });
-            } catch {
-                // keep local timers running
+            } catch (err) {
+                console.error('[dashboard poll]', err);
             }
         }, 60000);
         return () => window.clearInterval(interval);
@@ -50,12 +45,22 @@ export default function Dashboard({
         setModalOpen(true);
     };
 
+    const safeRooms = Array.isArray(rooms)
+        ? rooms.filter((room) => room && room.id != null && room.name)
+        : [];
+
+    const uniqueRooms = safeRooms.filter(
+        (room, index, self) => self.findIndex((r) => r.name === room.name) === index
+    );
+
     return (
         <KaraokeBackground>
             <div className="mx-auto w-full max-w-7xl px-4 py-6 sm:px-6 lg:px-8">
                 <div className="flex flex-col gap-5">
                     <div className="relative z-50 page-rise">
-                        <LiveAvailabilityHeader serverTimestamp={serverTimestamp} />
+                        <ErrorBoundary label="Header">
+                            <LiveAvailabilityHeader serverTimestamp={serverTimestamp} />
+                        </ErrorBoundary>
                     </div>
 
                     {flash?.success && (
@@ -80,37 +85,48 @@ export default function Dashboard({
                     </div>
 
                     <div className="page-rise page-rise-delay-2 grid gap-5 lg:grid-cols-2">
-                        {rooms &&
-                            rooms
-                                .filter(
-                                    (room, index, self) =>
-                                        self.findIndex((r) => r.name === room.name) === index
-                                )
-                                .map((room) => (
-                                    <RoomColumn
-                                        key={room.id}
-                                        room={room}
-                                        onOpenBooking={handleOpenBooking}
-                                    />
-                                ))}
+                        {uniqueRooms.map((room) => (
+                            <ErrorBoundary key={room.id} label={room.name || 'Room'}>
+                                <RoomColumn
+                                    room={room}
+                                    rooms={uniqueRooms}
+                                    onOpenBooking={handleOpenBooking}
+                                />
+                            </ErrorBoundary>
+                        ))}
                     </div>
 
                     <div className="page-rise page-rise-delay-3">
-                        <AgendaView reservations={reservations} rooms={rooms} />
+                        <ErrorBoundary label="Agenda">
+                            <AgendaView reservations={reservations || []} rooms={uniqueRooms} />
+                        </ErrorBoundary>
                     </div>
                 </div>
 
-                <QuickBookingModal
-                    rooms={rooms}
-                    durationPresets={durationPresets}
-                    open={modalOpen}
-                    onClose={() => {
+                <ErrorBoundary
+                    label="New booking"
+                    onReset={() => {
                         setModalOpen(false);
                         setSelectedRoomId(null);
                     }}
-                    selectedRoomId={selectedRoomId}
-                />
-                <HistoryModal open={historyOpen} onClose={() => setHistoryOpen(false)} />
+                >
+                    {modalOpen ? (
+                        <QuickBookingModal
+                            rooms={uniqueRooms}
+                            durationPresets={durationPresets}
+                            open={modalOpen}
+                            onClose={() => {
+                                setModalOpen(false);
+                                setSelectedRoomId(null);
+                            }}
+                            selectedRoomId={selectedRoomId}
+                        />
+                    ) : null}
+                </ErrorBoundary>
+
+                <ErrorBoundary label="History">
+                    <HistoryModal open={historyOpen} onClose={() => setHistoryOpen(false)} />
+                </ErrorBoundary>
             </div>
         </KaraokeBackground>
     );

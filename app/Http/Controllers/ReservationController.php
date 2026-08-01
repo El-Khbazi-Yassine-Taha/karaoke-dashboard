@@ -22,12 +22,13 @@ class ReservationController extends Controller
         $clientName = $request->input('client_name') ?? $request->input('clientName');
         $startClockTime = $request->input('start_clock_time') ?? $request->input('startTime');
         $duration = (int) ($request->input('duration_minutes') ?? $request->input('durationMinutes', 60));
+        $duration = max(0, min(100, $duration));
 
         $todayDate = $reservation->date
             ? Carbon::parse($reservation->date)->format('Y-m-d')
             : Carbon::now()->format('Y-m-d');
         $newStart = Carbon::parse("{$todayDate} {$startClockTime}");
-        $newEnd = (clone $newStart)->addMinutes(max(15, $duration));
+        $newEnd = (clone $newStart)->addMinutes($duration);
 
         $closingLimit = Carbon::parse("{$todayDate} 23:00:00");
         if ($newEnd->greaterThan($closingLimit)) {
@@ -47,34 +48,53 @@ class ReservationController extends Controller
             'date' => $todayDate,
         ]);
 
-        // Keep agenda-waw in sync: free old hour, occupy new hour(s)
-        try {
-            if ($oldAgendaId) {
-                $this->agenda->updateCheckInStatus($oldAgendaId, 'cancelled');
-            }
+        // Keep agenda-waw in sync after the desk UI already refreshed
+        $reservationId = (int) $reservation->id;
+        $clientName = (string) $reservation->client_name;
+        $roomName = (string) $reservation->room_name;
+        $members = (int) ($reservation->members_count ?? 1);
+        $startIso = $newStart->toIso8601String();
+        $endIso = $newEnd->toIso8601String();
 
-            $roomNumber = 1;
-            if (preg_match('/(\d+)/', (string) $reservation->room_name, $m)) {
-                $roomNumber = (int) $m[1];
-            }
+        $this->agenda->defer(function (AgendaClient $agenda) use (
+            $reservationId,
+            $oldAgendaId,
+            $clientName,
+            $roomName,
+            $members,
+            $startIso,
+            $endIso
+        ) {
+            try {
+                if ($oldAgendaId) {
+                    $agenda->updateCheckInStatus($oldAgendaId, 'cancelled');
+                }
 
-            $ids = $this->agenda->blockOverlappingHours(
-                $newStart,
-                $newEnd,
-                $reservation->client_name,
-                $roomNumber,
-                (int) ($reservation->members_count ?? 1)
-            );
+                $roomNumber = 1;
+                if (preg_match('/(\d+)/', $roomName, $m)) {
+                    $roomNumber = (int) $m[1];
+                }
 
-            if ($ids !== []) {
-                $reservation->update(['agenda_booking_id' => $ids[0]]);
+                $ids = $agenda->blockOverlappingHours(
+                    Carbon::parse($startIso),
+                    Carbon::parse($endIso),
+                    $clientName,
+                    $roomNumber,
+                    $members
+                );
+
+                if ($ids !== []) {
+                    Reservation::where('id', $reservationId)->update([
+                        'agenda_booking_id' => $ids[0],
+                    ]);
+                }
+            } catch (\Throwable $e) {
+                Log::warning('Agenda reschedule failed', [
+                    'reservation' => $reservationId,
+                    'error' => $e->getMessage(),
+                ]);
             }
-        } catch (\Throwable $e) {
-            Log::warning('Agenda reschedule failed', [
-                'reservation' => $reservation->id,
-                'error' => $e->getMessage(),
-            ]);
-        }
+        });
 
         return redirect()->back();
     }
@@ -88,10 +108,99 @@ class ReservationController extends Controller
         ]);
 
         if ($reservation->agenda_booking_id) {
-            $this->agenda->updateCheckInStatus((string) $reservation->agenda_booking_id, 'cancelled');
+            $agendaId = (string) $reservation->agenda_booking_id;
+            $this->agenda->defer(function (AgendaClient $agenda) use ($agendaId) {
+                $agenda->updateCheckInStatus($agendaId, 'cancelled');
+            });
         }
 
         return redirect()->back();
+    }
+
+    /**
+     * Move a web reservation to the other room on the staff dashboard (+ agenda when possible).
+     */
+    public function switchRoom(Request $request, Reservation $reservation)
+    {
+        if (! in_array($reservation->status, ['confirmed', 'checked_in'], true)) {
+            return back()->withErrors(['room' => 'This reservation cannot be moved.']);
+        }
+
+        $targetRoomId = (int) ($request->input('room_id') ?? 0);
+        $target = Room::query()->find($targetRoomId);
+
+        if (! $target) {
+            return back()->withErrors(['room' => 'Target room not found.']);
+        }
+
+        if ((string) $reservation->room_name === (string) $target->name) {
+            return back()->withErrors(['room' => 'Reservation is already in that room.']);
+        }
+
+        $start = Carbon::parse($reservation->check_in);
+        $end = Carbon::parse($reservation->check_out);
+
+        $deskConflict = Booking::query()
+            ->where('room_id', $target->id)
+            ->whereNotIn('status', ['cancelled', 'no_show', 'completed'])
+            ->where('start_time', '<', $end)
+            ->where('end_time', '>', $start)
+            ->first();
+
+        if ($deskConflict) {
+            return back()->withErrors([
+                'room' => sprintf(
+                    '%s is busy with %s (%s–%s).',
+                    $target->name,
+                    $deskConflict->client_name,
+                    Carbon::parse($deskConflict->start_time)->format('H:i'),
+                    Carbon::parse($deskConflict->end_time)->format('H:i')
+                ),
+            ]);
+        }
+
+        $webConflict = Reservation::query()
+            ->where('id', '!=', $reservation->id)
+            ->where('room_name', $target->name)
+            ->whereIn('status', ['confirmed', 'checked_in'])
+            ->where('check_in', '<', $end)
+            ->where('check_out', '>', $start)
+            ->where(function ($q) {
+                $q->whereNull('client_email')
+                    ->orWhere('client_email', '!=', 'desk@waw.local');
+            })
+            ->where('client_name', 'not like', 'Desk ·%')
+            ->first();
+
+        if ($webConflict) {
+            return back()->withErrors([
+                'room' => sprintf(
+                    '%s already has a web reservation for %s.',
+                    $target->name,
+                    $webConflict->client_name
+                ),
+            ]);
+        }
+
+        $roomNumber = 1;
+        if (preg_match('/(\d+)/', $target->name, $m)) {
+            $roomNumber = (int) $m[1];
+        }
+
+        $reservation->update(['room_name' => $target->name]);
+
+        if ($reservation->agenda_booking_id) {
+            $agendaId = (string) $reservation->agenda_booking_id;
+            $this->agenda->defer(function (AgendaClient $agenda) use ($agendaId, $roomNumber) {
+                $agenda->updateRoomNumber($agendaId, $roomNumber);
+            });
+        }
+
+        return back()->with('success', sprintf(
+            '%s moved to %s.',
+            $reservation->client_name,
+            $target->name
+        ));
     }
 
     /**
@@ -166,11 +275,11 @@ class ReservationController extends Controller
         ]);
 
         if ($reservation->agenda_booking_id) {
-            $this->agenda->updateCheckInStatus(
-                (string) $reservation->agenda_booking_id,
-                'checked_in',
-                $paid ? 'paid' : 'not_paid'
-            );
+            $agendaId = (string) $reservation->agenda_booking_id;
+            $paidFlag = $paid ? 'paid' : 'not_paid';
+            $this->agenda->defer(function (AgendaClient $agenda) use ($agendaId, $paidFlag) {
+                $agenda->updateCheckInStatus($agendaId, 'checked_in', $paidFlag);
+            });
         }
 
         BookingController::repairRoomSchedule($room->id);
@@ -193,7 +302,10 @@ class ReservationController extends Controller
         ]);
 
         if ($reservation->agenda_booking_id) {
-            $this->agenda->updateCheckInStatus((string) $reservation->agenda_booking_id, 'no_show');
+            $agendaId = (string) $reservation->agenda_booking_id;
+            $this->agenda->defer(function (AgendaClient $agenda) use ($agendaId) {
+                $agenda->updateCheckInStatus($agendaId, 'no_show');
+            });
         }
 
         return redirect()->back();

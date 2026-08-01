@@ -1,5 +1,6 @@
 import { useMemo, useState, useEffect } from 'react';
 import { router } from '@inertiajs/react';
+import { deskVisit } from '../lib/deskVisit';
 
 const DURATION_PRESETS = [
     { label: '30m', minutes: 30 },
@@ -8,6 +9,8 @@ const DURATION_PRESETS = [
     { label: '2h', minutes: 120 },
 ];
 
+const CLOSING_LIMIT_MINS = 23 * 60;
+
 function currentHHMM() {
     const d = new Date();
     return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
@@ -15,106 +18,201 @@ function currentHHMM() {
 
 function timeToMins(t) {
     if (!t) return 0;
-    const [h, m] = t.split(':').map(Number);
+    const [h, m] = String(t).split(':').map(Number);
     let mins = h * 60 + (m || 0);
-    if (h < 6) mins += 1440; // Midnight crossover
+    if (h < 6) mins += 1440;
     return mins;
 }
 
 function minsToTime(m) {
-    const h = Math.floor(m / 60) % 24;
-    const mins = m % 60;
+    const total = ((m % 1440) + 1440) % 1440;
+    const h = Math.floor(total / 60) % 24;
+    const mins = total % 60;
     return `${String(h).padStart(2, '0')}:${String(mins).padStart(2, '0')}`;
 }
 
-export default function QuickBookingModal({ open, onClose, rooms, selectedRoomId }) {
-    const DISABLE_CLOSING_CHECK = true;
+/** Busy blocks for a room: live session + upcoming queue. */
+function collectBusyBlocks(room) {
+    if (!room) return { raw: [], merged: [] };
+    const blocks = [];
 
+    if (room.state === 'occupied' && room.checkoutTime) {
+        blocks.push({
+            start: room.startTime || currentHHMM(),
+            end: room.checkoutTime,
+            name: room.currentClient || 'Live',
+        });
+    }
+
+    for (const b of room.upcoming || []) {
+        const status = (b.status || '').toLowerCase();
+        if (status === 'in_progress') continue;
+        if (!b.start || !b.end) continue;
+        blocks.push({
+            start: b.start,
+            end: b.end,
+            name: b.clientName || 'Guest',
+        });
+    }
+
+    blocks.sort((a, b) => timeToMins(a.start) - timeToMins(b.start));
+
+    const merged = [];
+    for (const b of blocks) {
+        const start = timeToMins(b.start);
+        const end = timeToMins(b.end);
+        if (!merged.length || start > merged[merged.length - 1].endMins) {
+            merged.push({
+                startMins: start,
+                endMins: end,
+                start: b.start,
+                end: b.end,
+                name: b.name,
+            });
+        } else {
+            const last = merged[merged.length - 1];
+            last.endMins = Math.max(last.endMins, end);
+            last.end = minsToTime(last.endMins);
+        }
+    }
+
+    return { raw: blocks, merged };
+}
+
+/**
+ * Gaps that fit durationMinutes (between now and closing).
+ * Also returns busyUntil = end of continuous stack from now.
+ * Never throws — bad room data must not blank the dashboard.
+ */
+function findScheduleGaps(room, durationMinutes) {
+    const empty = {
+        gaps: [],
+        nextSlot: null,
+        busyUntil: null,
+        isFreeNow: false,
+    };
+
+    try {
+        const nowMins = timeToMins(currentHHMM());
+        const blocks = collectBusyBlocks(room);
+        const raw = Array.isArray(blocks?.raw) ? blocks.raw : [];
+        const merged = Array.isArray(blocks?.merged) ? blocks.merged : [];
+        const duration = Math.max(1, Number(durationMinutes) || 60);
+
+        let cursor = nowMins;
+        for (const b of raw) {
+            const s = timeToMins(b.start);
+            const e = timeToMins(b.end);
+            if (s <= cursor && e > cursor) {
+                cursor = e;
+            }
+        }
+
+        const gaps = [];
+        const sorted = [...raw].sort((a, b) => timeToMins(a.start) - timeToMins(b.start));
+
+        for (const b of sorted) {
+            const bStart = timeToMins(b.start);
+            const bEnd = timeToMins(b.end);
+            if (bEnd <= cursor) continue;
+
+            if (bStart > cursor) {
+                const gapLen = bStart - cursor;
+                if (gapLen >= duration) {
+                    gaps.push({
+                        start: minsToTime(cursor),
+                        end: minsToTime(bStart),
+                        minutes: gapLen,
+                        label:
+                            cursor <= nowMins + 1
+                                ? `Now → ${minsToTime(bStart)}`
+                                : `${minsToTime(cursor)} → ${minsToTime(bStart)}`,
+                        beforeGuest: b.name,
+                    });
+                }
+            }
+            cursor = Math.max(cursor, bEnd);
+        }
+
+        if (cursor < CLOSING_LIMIT_MINS && CLOSING_LIMIT_MINS - cursor >= duration) {
+            gaps.push({
+                start: minsToTime(cursor),
+                end: minsToTime(CLOSING_LIMIT_MINS),
+                minutes: CLOSING_LIMIT_MINS - cursor,
+                label: `After stack · from ${minsToTime(cursor)}`,
+                afterStack: true,
+            });
+        }
+
+        const stackEndMins = merged.reduce((max, m) => Math.max(max, m.endMins || 0), nowMins);
+        const busyUntil =
+            stackEndMins > nowMins && (room?.state === 'occupied' || (room?.upcoming || []).length > 0)
+                ? minsToTime(stackEndMins)
+                : null;
+
+        return {
+            gaps,
+            nextSlot: gaps[0]?.start || null,
+            busyUntil,
+            isFreeNow: room?.state === 'free' && gaps[0] && timeToMins(gaps[0].start) <= nowMins + 1,
+        };
+    } catch (err) {
+        console.error('[findScheduleGaps]', err);
+        return empty;
+    }
+}
+
+export default function QuickBookingModal({ open, onClose, rooms, selectedRoomId }) {
     const [clientName, setClientName] = useState('');
+    const [clientPhone, setClientPhone] = useState('');
     const [roomId, setRoomId] = useState('');
     const [startNow, setStartNow] = useState(true);
     const [clockTime, setClockTime] = useState(currentHHMM());
     const [duration, setDuration] = useState(60);
     const [customDuration, setCustomDuration] = useState('');
-    
-    // Member count
+    const [selectedGapStart, setSelectedGapStart] = useState(null);
+
     const [membersCount, setMembersCount] = useState(1);
     const [isComplimentary, setIsComplimentary] = useState(false);
     const [invitedBy, setInvitedBy] = useState('');
 
     const [submitting, setSubmitting] = useState(false);
     const [serverErrors, setServerErrors] = useState({});
-    const [webSlotStatus, setWebSlotStatus] = useState(null); // { available, label } | null
-    const [webSlotLoading, setWebSlotLoading] = useState(false);
 
     const selectedRoom = rooms.find((r) => String(r.id) === String(roomId));
     const effectiveDuration = customDuration ? parseInt(customDuration, 10) : duration;
 
-    // Sync room & default time when modal opens
-    useEffect(() => {
-        if (open) {
-            const targetRoomId = selectedRoomId || (rooms.length > 0 ? rooms[0].id : '');
-            setRoomId(targetRoomId);
+    const schedule = useMemo(
+        () => findScheduleGaps(selectedRoom, effectiveDuration),
+        [selectedRoom, effectiveDuration]
+    );
 
-            const targetRoom = rooms.find((r) => String(r.id) === String(targetRoomId));
-            if (targetRoom && targetRoom.checkoutTime) {
-                setClockTime(targetRoom.checkoutTime);
-            } else {
-                setClockTime(currentHHMM());
-            }
-
-            setMembersCount(1);
-            setIsComplimentary(false);
-            setInvitedBy('');
-            setServerErrors({});
-            setWebSlotStatus(null);
-        }
-    }, [open, selectedRoomId, rooms]);
-
-    // Check agenda-waw for Libre / Déjà réservé on the chosen hour
+    // Sync room & defaults when modal opens
     useEffect(() => {
         if (!open) return;
 
-        const date = new Date();
-        const dateStr = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
-        let time = startNow ? currentHHMM() : clockTime;
-        if (startNow && selectedRoom?.state === 'occupied' && selectedRoom.checkoutTime) {
-            time = selectedRoom.checkoutTime;
-        }
-        const hour = `${String(time).slice(0, 2)}:00`;
+        const targetRoomId = selectedRoomId || (rooms.length > 0 ? rooms[0].id : '');
+        setRoomId(targetRoomId);
 
-        let cancelled = false;
-        setWebSlotLoading(true);
-        fetch(`/agenda/availability?date=${encodeURIComponent(dateStr)}&time=${encodeURIComponent(hour)}`, {
-            headers: { Accept: 'application/json' },
-            credentials: 'same-origin',
-        })
-            .then((r) => r.json())
-            .then((data) => {
-                if (cancelled) return;
-                if (typeof data?.available === 'boolean') {
-                    setWebSlotStatus({
-                        available: data.available,
-                        label: data.label || (data.available ? 'Libre' : 'Déjà réservé'),
-                        time: hour,
-                    });
-                } else {
-                    setWebSlotStatus(null);
-                }
-            })
-            .catch(() => {
-                if (!cancelled) setWebSlotStatus(null);
-            })
-            .finally(() => {
-                if (!cancelled) setWebSlotLoading(false);
-            });
+        const targetRoom = rooms.find((r) => String(r.id) === String(targetRoomId));
+        const info = findScheduleGaps(targetRoom, effectiveDuration || 60);
+        setStartNow(true);
+        setSelectedGapStart(null);
+        setClockTime(info.nextSlot || targetRoom?.checkoutTime || currentHHMM());
 
-        return () => {
-            cancelled = true;
-        };
-    }, [open, startNow, clockTime, selectedRoom, roomId]);
+        setClientPhone('');
+        setMembersCount(1);
+        setIsComplimentary(false);
+        setInvitedBy('');
+        setServerErrors({});
+    }, [open, selectedRoomId, rooms]);
 
-    // Calculate dynamic price safely handling empty states
+    // Keep proposed clock in sync when duration / room changes on "stack"
+    useEffect(() => {
+        if (!open || !startNow || selectedGapStart) return;
+        if (schedule.nextSlot) setClockTime(schedule.nextSlot);
+    }, [open, startNow, selectedGapStart, schedule.nextSlot, effectiveDuration, roomId]);
+
     const parsedMembers = membersCount === '' ? 1 : membersCount;
     const listPrice = parsedMembers <= 4 ? 200 : 200 + (parsedMembers - 4) * 40;
     const totalPrice = isComplimentary ? 0 : listPrice;
@@ -126,110 +224,96 @@ export default function QuickBookingModal({ open, onClose, rooms, selectedRoomId
         return currentHHMM();
     }, [selectedRoom]);
 
-    // Evaluate accurate gap, previous room overlaps & buffer delay
+    const proposedStartTime = startNow
+        ? selectedGapStart || schedule.nextSlot || currentHHMM()
+        : clockTime;
+
     const collisionState = useMemo(() => {
         if (!selectedRoom) return { status: 'ok' };
 
-        let proposedStart = 0;
-        if (startNow) {
-            if (selectedRoom.state === 'occupied' && selectedRoom.checkoutTime) {
-                proposedStart = timeToMins(selectedRoom.checkoutTime);
-            } else {
-                proposedStart = timeToMins(currentHHMM());
-            }
-        } else {
-            proposedStart = timeToMins(clockTime);
-        }
-
+        const proposedStart = timeToMins(proposedStartTime);
         const proposedEnd = proposedStart + effectiveDuration;
 
-        // ── CLOSING TIME VALIDATION (23:00) ─────────────────────────────
-        const CLOSING_LIMIT_MINS = 23 * 60; // 23:00
         if (proposedEnd > CLOSING_LIMIT_MINS) {
             return {
                 status: 'closing_violation',
                 message: `The venue closes at 23:00. This session would end at ${minsToTime(proposedEnd)}, which is past closing time.`,
             };
         }
-        // ────────────────────────────────────────────────────────────────
 
-        if (selectedRoom.state === 'occupied' && selectedRoom.checkoutTime && !startNow) {
+        if (selectedRoom.state === 'occupied' && selectedRoom.checkoutTime) {
             const checkoutMins = timeToMins(selectedRoom.checkoutTime);
             if (proposedStart < checkoutMins) {
-                const earlyMins = checkoutMins - proposedStart;
                 return {
                     status: 'busy_conflict',
-                    message: `Room is busy until ${selectedRoom.checkoutTime}. You entered a start time that overlaps the current session by ${earlyMins} min!`,
+                    message: `Room is live until ${selectedRoom.checkoutTime}. Earliest slot is ${schedule.nextSlot || selectedRoom.checkoutTime}.`,
                 };
             }
         }
 
-        if (selectedRoom.upcoming?.length) {
-            for (const b of selectedRoom.upcoming) {
-                if (b.status === 'IN_PROGRESS' || b.status === 'in_progress') continue;
+        for (const b of selectedRoom.upcoming || []) {
+            const status = (b.status || '').toLowerCase();
+            if (status === 'in_progress') continue;
 
-                const upStart = timeToMins(b.start);
-                const upEnd = timeToMins(b.end);
+            const upStart = timeToMins(b.start);
+            const upEnd = timeToMins(b.end);
 
-                if (proposedStart >= upStart && proposedStart < upEnd && !startNow) {
-                    const earlyMins = upEnd - proposedStart;
+            if (proposedStart >= upStart && proposedStart < upEnd) {
+                return {
+                    status: 'busy_conflict',
+                    message: `Overlaps ${b.clientName}'s reservation (${b.start}–${b.end}).`,
+                };
+            }
+
+            if (upStart > proposedStart && proposedEnd > upStart) {
+                const overlapMinutes = proposedEnd - upStart;
+                if (overlapMinutes <= 10) {
                     return {
-                        status: 'busy_conflict',
-                        message: `Overlaps into ${b.clientName}'s reservation (${b.start}–${b.end}) by ${earlyMins} min!`,
+                        status: 'warning',
+                        clientName: b.clientName,
+                        start: b.start,
+                        proposedEndStr: minsToTime(proposedEnd),
+                        overlapMinutes,
                     };
                 }
-
-                if (upStart > proposedStart && proposedEnd > upStart) {
-                    const overlapMinutes = proposedEnd - upStart;
-
-                    if (overlapMinutes <= 10) {
-                        return {
-                            status: 'warning',
-                            clientName: b.clientName,
-                            start: b.start,
-                            proposedEndStr: minsToTime(proposedEnd),
-                            overlapMinutes,
-                        };
-                    } else {
-                        return {
-                            status: 'blocked',
-                            clientName: b.clientName,
-                            start: b.start,
-                            overlapMinutes,
-                        };
-                    }
-                }
+                return {
+                    status: 'blocked',
+                    clientName: b.clientName,
+                    start: b.start,
+                    overlapMinutes,
+                };
             }
         }
 
         return { status: 'ok' };
-    }, [selectedRoom, startNow, clockTime, effectiveDuration, DISABLE_CLOSING_CHECK]);
+    }, [selectedRoom, proposedStartTime, effectiveDuration, schedule.nextSlot]);
 
     if (!open) return null;
+
+    function pickGap(gap) {
+        setSelectedGapStart(gap.start);
+        setStartNow(false);
+        setClockTime(gap.start);
+    }
 
     function submit(e) {
         e.preventDefault();
 
-        if (webSlotStatus && webSlotStatus.available === false) {
-            alert('❌ Déjà réservé (web)\n\nCe créneau est pris sur agenda-waw. Choisissez un autre horaire.');
-            return;
-        }
-
         if (collisionState.status === 'busy_conflict' || collisionState.status === 'closing_violation') {
-            alert(`❌ TIME BLOCKED:\n\n${collisionState.message}`);
+            alert(`TIME BLOCKED:\n\n${collisionState.message}`);
             return;
         }
 
         if (collisionState.status === 'blocked') {
             alert(
-                `❌ ACTION BLOCKED:\n\nThis booking overflows into ${collisionState.clientName}'s reservation by ${collisionState.overlapMinutes} minutes. The maximum allowed delay buffer is 10 minutes!`
+                `ACTION BLOCKED:\n\nThis booking overflows into ${collisionState.clientName}'s reservation by ${collisionState.overlapMinutes} minutes. The maximum allowed delay buffer is 10 minutes!`
             );
             return;
         }
 
         if (collisionState.status === 'warning') {
             const confirmed = window.confirm(
-                `⚠️ 10-MINUTE BUFFER OVERRIDE:\n\nThis will delay ${collisionState.clientName}'s start time by ${collisionState.overlapMinutes} minutes (pushing them to ${collisionState.proposedEndStr}). Their full duration will be safely preserved.\n\nProceed with this adjustment?`
+                `10-MINUTE BUFFER:\n\nThis will delay ${collisionState.clientName}'s start by ${collisionState.overlapMinutes} minutes (to ${collisionState.proposedEndStr}). Continue?`
             );
             if (!confirmed) return;
         }
@@ -237,13 +321,21 @@ export default function QuickBookingModal({ open, onClose, rooms, selectedRoomId
         setSubmitting(true);
         setServerErrors({});
 
+        // If staff picked a gap (or stack next slot), send that clock time.
+        // "start_now" only when we truly want the server gap-finder and no explicit slot.
+        const usingExplicitSlot = !startNow || Boolean(selectedGapStart);
+        const startClock = usingExplicitSlot
+            ? clockTime
+            : null;
+
         router.post(
             '/bookings',
             {
                 client_name: clientName,
+                client_phone: clientPhone.trim() || null,
                 room_id: roomId,
-                start_now: startNow,
-                start_clock_time: startNow ? null : clockTime,
+                start_now: usingExplicitSlot ? 0 : 1,
+                start_clock_time: usingExplicitSlot ? startClock : null,
                 duration_minutes: effectiveDuration,
                 members_count: parsedMembers,
                 is_paid: 0,
@@ -251,13 +343,15 @@ export default function QuickBookingModal({ open, onClose, rooms, selectedRoomId
                 invited_by: isComplimentary ? invitedBy : null,
             },
             {
-                preserveScroll: true,
+                ...deskVisit,
                 onSuccess: () => {
                     setClientName('');
+                    setClientPhone('');
                     setCustomDuration('');
                     setMembersCount(1);
                     setIsComplimentary(false);
                     setInvitedBy('');
+                    setSelectedGapStart(null);
                     onClose();
                 },
                 onError: (errors) => setServerErrors(errors),
@@ -272,6 +366,21 @@ export default function QuickBookingModal({ open, onClose, rooms, selectedRoomId
         on
             ? 'rounded-lg bg-[#111] px-3 py-2 text-sm font-semibold text-white'
             : 'rounded-lg border border-[#E8E4D9] bg-white px-3 py-2 text-sm font-semibold text-[#111] transition hover:bg-[#F7F4EC]';
+
+    function roomSubtitle(room) {
+        const info = findScheduleGaps(room, effectiveDuration || 60);
+        if (room.state === 'free' && !info.busyUntil) {
+            return info.nextSlot ? `Libre · prochain ${info.nextSlot}` : 'Libre';
+        }
+        if (info.busyUntil) {
+            const gapHint =
+                info.gaps.length > 1 || (info.gaps.length === 1 && !info.gaps[0].afterStack)
+                    ? ` · gap ${info.gaps[0].start}`
+                    : '';
+            return `Occupé jusqu’à ${info.busyUntil}${gapHint}`;
+        }
+        return room.state === 'free' ? 'Libre' : `Occupé jusqu’à ${room.checkoutTime || '—'}`;
+    }
 
     return (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
@@ -313,6 +422,21 @@ export default function QuickBookingModal({ open, onClose, rooms, selectedRoomId
 
                     <div>
                         <label className="mb-1 block text-[10px] font-semibold uppercase tracking-wide text-[#6B6B6B]">
+                            Phone number
+                        </label>
+                        <input
+                            type="tel"
+                            value={clientPhone}
+                            onChange={(e) => setClientPhone(e.target.value)}
+                            className={field}
+                            placeholder="e.g. 06 12 34 56 78"
+                            inputMode="tel"
+                            autoComplete="tel"
+                        />
+                    </div>
+
+                    <div>
+                        <label className="mb-1 block text-[10px] font-semibold uppercase tracking-wide text-[#6B6B6B]">
                             Room
                         </label>
                         <div className="grid grid-cols-2 gap-2">
@@ -322,7 +446,10 @@ export default function QuickBookingModal({ open, onClose, rooms, selectedRoomId
                                     type="button"
                                     onClick={() => {
                                         setRoomId(room.id);
-                                        if (room.checkoutTime) setClockTime(room.checkoutTime);
+                                        setSelectedGapStart(null);
+                                        setStartNow(true);
+                                        const info = findScheduleGaps(room, effectiveDuration || 60);
+                                        setClockTime(info.nextSlot || room.checkoutTime || currentHHMM());
                                     }}
                                     className={`rounded-xl border px-3 py-2.5 text-left transition ${
                                         String(roomId) === String(room.id)
@@ -331,64 +458,30 @@ export default function QuickBookingModal({ open, onClose, rooms, selectedRoomId
                                     }`}
                                 >
                                     <div className="font-semibold">{room.name}</div>
-                                    <div className={`text-xs ${String(roomId) === String(room.id) ? 'text-white/70' : 'text-[#6B6B6B]'}`}>
-                                        {room.state === 'free' ? 'Libre' : `Occupé jusqu’à ${room.checkoutTime}`}
+                                    <div
+                                        className={`text-[11px] leading-snug ${
+                                            String(roomId) === String(room.id)
+                                                ? 'text-white/75'
+                                                : 'text-[#6B6B6B]'
+                                        }`}
+                                    >
+                                        {roomSubtitle(room)}
                                     </div>
                                 </button>
                             ))}
                         </div>
-                    </div>
-
-                    <div className="rounded-lg border border-[#E8E4D9] bg-[#F7F4EC] px-3 py-2 text-sm">
-                        <p className="text-[10px] font-semibold uppercase tracking-wide text-[#6B6B6B]">
-                            Agenda web · créneau horaire
-                        </p>
-                        {webSlotLoading ? (
-                            <p className="mt-1 text-[#6B6B6B]">Vérification…</p>
-                        ) : webSlotStatus ? (
-                            <p
-                                className={`mt-1 font-semibold ${
-                                    webSlotStatus.available ? 'text-emerald-700' : 'text-red-700'
-                                }`}
-                            >
-                                {webSlotStatus.time} — {webSlotStatus.label}
-                                {!webSlotStatus.available ? ' (web)' : ''}
+                        {selectedRoom && schedule.busyUntil && (
+                            <p className="mt-2 text-xs font-medium text-[#6B6B6B]">
+                                Full stack busy until <span className="font-semibold text-[#111]">{schedule.busyUntil}</span>
+                                {schedule.nextSlot ? (
+                                    <>
+                                        {' '}
+                                        · next free slot{' '}
+                                        <span className="font-semibold text-[#111]">{schedule.nextSlot}</span>
+                                    </>
+                                ) : null}
                             </p>
-                        ) : (
-                            <p className="mt-1 text-[#6B6B6B]">Disponibilité web indisponible</p>
                         )}
-                    </div>
-
-                    <div>
-                        <label className="mb-1 block text-[10px] font-semibold uppercase tracking-wide text-[#6B6B6B]">
-                            Start time
-                        </label>
-                        <div className="flex flex-wrap gap-2">
-                            <button type="button" onClick={() => setStartNow(true)} className={pick(startNow)}>
-                                Right now / stack
-                            </button>
-                            <button
-                                type="button"
-                                onClick={() => {
-                                    setStartNow(false);
-                                    if (selectedRoom && selectedRoom.checkoutTime) {
-                                        setClockTime(selectedRoom.checkoutTime);
-                                    }
-                                }}
-                                className={pick(!startNow)}
-                            >
-                                Schedule later
-                            </button>
-                            {!startNow && (
-                                <input
-                                    type="time"
-                                    min={minClockTime}
-                                    value={clockTime}
-                                    onChange={(e) => setClockTime(e.target.value)}
-                                    className={field + ' !w-auto'}
-                                />
-                            )}
-                        </div>
                     </div>
 
                     <div>
@@ -420,6 +513,100 @@ export default function QuickBookingModal({ open, onClose, rooms, selectedRoomId
                         </div>
                     </div>
 
+                    {schedule.gaps.length > 0 && (
+                        <div>
+                            <label className="mb-1 block text-[10px] font-semibold uppercase tracking-wide text-[#6B6B6B]">
+                                Free gaps ({effectiveDuration} min)
+                            </label>
+                            <div className="flex flex-col gap-2">
+                                {schedule.gaps.map((gap) => {
+                                    const selected =
+                                        (startNow && !selectedGapStart && gap.start === schedule.nextSlot) ||
+                                        selectedGapStart === gap.start ||
+                                        (!startNow && clockTime === gap.start);
+                                    return (
+                                        <button
+                                            key={`${gap.start}-${gap.end}`}
+                                            type="button"
+                                            onClick={() => {
+                                                if (gap.afterStack && gap.start === schedule.nextSlot) {
+                                                    setSelectedGapStart(null);
+                                                    setStartNow(true);
+                                                    setClockTime(gap.start);
+                                                } else {
+                                                    pickGap(gap);
+                                                }
+                                            }}
+                                            className={`rounded-xl border px-3 py-2.5 text-left transition ${
+                                                selected
+                                                    ? 'border-[#111] bg-[#FFD400]/35'
+                                                    : 'border-[#E8E4D9] bg-white hover:border-[#111]'
+                                            }`}
+                                        >
+                                            <div className="text-sm font-semibold text-[#111]">{gap.label}</div>
+                                            <div className="text-[11px] font-medium text-[#6B6B6B]">
+                                                {gap.minutes} min free
+                                                {gap.beforeGuest ? ` · before ${gap.beforeGuest}` : ''}
+                                                {gap.afterStack ? ' · end of day stack' : ''}
+                                            </div>
+                                        </button>
+                                    );
+                                })}
+                            </div>
+                        </div>
+                    )}
+
+                    <div>
+                        <label className="mb-1 block text-[10px] font-semibold uppercase tracking-wide text-[#6B6B6B]">
+                            Start time
+                        </label>
+                        <div className="flex flex-wrap gap-2">
+                            <button
+                                type="button"
+                                onClick={() => {
+                                    setStartNow(true);
+                                    setSelectedGapStart(null);
+                                    setClockTime(schedule.nextSlot || currentHHMM());
+                                }}
+                                className={pick(startNow && !selectedGapStart)}
+                            >
+                                Next free slot
+                                {schedule.nextSlot ? ` (${schedule.nextSlot})` : ''}
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => {
+                                    setStartNow(false);
+                                    setSelectedGapStart(null);
+                                    if (schedule.nextSlot) setClockTime(schedule.nextSlot);
+                                }}
+                                className={pick(!startNow && !selectedGapStart)}
+                            >
+                                Custom time
+                            </button>
+                            {!startNow && (
+                                <input
+                                    type="time"
+                                    min={minClockTime}
+                                    value={clockTime}
+                                    onChange={(e) => {
+                                        setClockTime(e.target.value);
+                                        setSelectedGapStart(e.target.value);
+                                    }}
+                                    className={field + ' !w-auto'}
+                                />
+                            )}
+                        </div>
+                        {proposedStartTime && (
+                            <p className="mt-2 text-xs font-medium text-[#6B6B6B]">
+                                Will book{' '}
+                                <span className="font-semibold text-[#111]">
+                                    {proposedStartTime}–{minsToTime(timeToMins(proposedStartTime) + effectiveDuration)}
+                                </span>
+                            </p>
+                        )}
+                    </div>
+
                     <div>
                         <label className="mb-1 block text-[10px] font-semibold uppercase tracking-wide text-[#6B6B6B]">
                             Members & pricing
@@ -444,13 +631,6 @@ export default function QuickBookingModal({ open, onClose, rooms, selectedRoomId
                                 </span>
                             </div>
                         </div>
-                        <p className="mt-1 text-[10px] text-[#6B6B6B]">
-                            {isComplimentary
-                                ? 'Staff invite — complimentary session'
-                                : parsedMembers <= 4
-                                  ? 'Standard rate (up to 4 members)'
-                                  : `200 DHS + ${(parsedMembers - 4) * 40} DHS for extra members`}
-                        </p>
                     </div>
 
                     <div>
@@ -476,9 +656,6 @@ export default function QuickBookingModal({ open, onClose, rooms, selectedRoomId
                                     className={field}
                                     placeholder="e.g. Name"
                                 />
-                                {serverErrors.invited_by && (
-                                    <p className="mt-1 text-sm text-red-600">{serverErrors.invited_by}</p>
-                                )}
                             </div>
                         )}
                     </div>
@@ -489,25 +666,31 @@ export default function QuickBookingModal({ open, onClose, rooms, selectedRoomId
                                 Blocked: {collisionState.message}
                             </div>
                         )}
-
                         {collisionState.status === 'warning' && (
                             <div className="rounded-xl border border-[#E8E4D9] bg-[#FFFBEA] p-3 text-xs font-medium leading-relaxed text-[#6B4E00]">
-                                Buffer notice: this pushes into {collisionState.clientName}&apos;s reservation by{' '}
-                                {collisionState.overlapMinutes} min (within the 10-min limit). Their start will
-                                shift to keep full duration.
+                                Buffer notice: pushes into {collisionState.clientName} by{' '}
+                                {collisionState.overlapMinutes} min.
                             </div>
                         )}
-
                         {collisionState.status === 'blocked' && (
                             <div className="rounded-xl border border-[#F5D0C8] bg-[#FFF5F3] p-3 text-xs font-medium leading-relaxed text-[#B42318]">
-                                Blocked: overlaps with {collisionState.clientName} by {collisionState.overlapMinutes}{' '}
-                                min. Exceeds the 10-minute buffer.
+                                Blocked: overlaps {collisionState.clientName} by {collisionState.overlapMinutes}{' '}
+                                min (over 10-min buffer).
                             </div>
                         )}
-
                         {collisionState.status === 'closing_violation' && (
                             <div className="rounded-xl border border-[#F5D0C8] bg-[#FFF5F3] p-3 text-xs font-medium leading-relaxed text-[#B42318]">
                                 {collisionState.message}
+                            </div>
+                        )}
+                        {serverErrors.start_clock_time && (
+                            <div className="rounded-xl border border-[#F5D0C8] bg-[#FFF5F3] p-3 text-xs font-medium text-[#B42318]">
+                                {serverErrors.start_clock_time}
+                            </div>
+                        )}
+                        {serverErrors.room_id && (
+                            <div className="rounded-xl border border-[#F5D0C8] bg-[#FFF5F3] p-3 text-xs font-medium text-[#B42318]">
+                                {serverErrors.room_id}
                             </div>
                         )}
                     </div>
@@ -522,15 +705,16 @@ export default function QuickBookingModal({ open, onClose, rooms, selectedRoomId
                                 submitting ||
                                 collisionState.status === 'blocked' ||
                                 collisionState.status === 'busy_conflict' ||
-                                collisionState.status === 'closing_violation'
+                                collisionState.status === 'closing_violation' ||
+                                schedule.gaps.length === 0
                             }
                             className="btn-waw"
                         >
                             {submitting
                                 ? 'Booking…'
                                 : collisionState.status === 'warning'
-                                ? 'Force booking'
-                                : 'Confirm booking'}
+                                  ? 'Force booking'
+                                  : 'Confirm booking'}
                         </button>
                     </div>
                 </form>

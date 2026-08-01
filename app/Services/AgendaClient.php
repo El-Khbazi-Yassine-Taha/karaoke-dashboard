@@ -20,9 +20,12 @@ class AgendaClient
         return $this->baseUrl() !== '';
     }
 
+    /**
+     * Short timeouts so the staff desk never waits on a cold Vercel function.
+     */
     protected function http()
     {
-        $request = Http::timeout(15)->acceptJson();
+        $request = Http::connectTimeout(0.8)->timeout(1.5)->acceptJson();
         $apiKey = config('services.agenda.key', env('AGENDA_API_KEY'));
         $pin = config('services.agenda.pin', env('AGENDA_ADMIN_PIN', 'waw2026'));
 
@@ -35,6 +38,20 @@ class AgendaClient
         }
 
         return $headers ? $request->withHeaders($headers) : $request;
+    }
+
+    /**
+     * Run Agenda HTTP work after the browser already got the redirect (desk stays snappy).
+     */
+    public function defer(callable $callback): void
+    {
+        dispatch(function () use ($callback) {
+            try {
+                $callback($this);
+            } catch (Throwable $e) {
+                Log::warning('Deferred agenda task failed', ['error' => $e->getMessage()]);
+            }
+        })->afterResponse();
     }
 
     /**
@@ -72,30 +89,61 @@ class AgendaClient
 
     public function isSlotFree(string $date, string $timeSlot, ?int $roomNumber = null): bool
     {
-        $payload = $this->getAvailability($date);
-        $slots = $payload['slots'] ?? [];
-        if (! is_array($slots)) {
-            return true;
+        // Desk speed: trust locally synced web reservations (no Vercel wait).
+        if ($roomNumber !== null) {
+            return ! $this->isRoomTakenLocally($date, $timeSlot, $roomNumber);
         }
 
-        foreach ($slots as $slot) {
-            if (! is_array($slot)) {
-                continue;
-            }
-            if (($slot['time'] ?? '') !== $timeSlot) {
-                continue;
-            }
-
-            // Room-specific: free if that room isn't among taken count for hour
-            // (availability API is hour-level; room check uses listBookings when room given)
-            if ($roomNumber !== null) {
-                return $this->isRoomFreeOnAgenda($date, $timeSlot, $roomNumber);
+        try {
+            $payload = $this->getAvailability($date);
+            $slots = $payload['slots'] ?? [];
+            if (! is_array($slots)) {
+                return true;
             }
 
-            return (bool) ($slot['available'] ?? false);
+            foreach ($slots as $slot) {
+                if (! is_array($slot)) {
+                    continue;
+                }
+                if (($slot['time'] ?? '') !== $timeSlot) {
+                    continue;
+                }
+
+                return (bool) ($slot['available'] ?? false);
+            }
+        } catch (Throwable $e) {
+            Log::warning('Agenda isSlotFree remote skipped', ['error' => $e->getMessage()]);
         }
 
         return true;
+    }
+
+    /**
+     * Web guest already holding this room/hour in the local karaoke DB.
+     */
+    protected function isRoomTakenLocally(string $date, string $timeSlot, int $roomNumber): bool
+    {
+        try {
+            $slotStart = Carbon::createFromFormat(
+                'Y-m-d H:i',
+                $date.' '.$timeSlot,
+                config('app.timezone')
+            );
+        } catch (Throwable) {
+            return false;
+        }
+
+        return Reservation::query()
+            ->whereDate('date', $date)
+            ->whereIn('status', ['confirmed', 'checked_in'])
+            ->where('room_name', 'Room '.$roomNumber)
+            ->where('check_in', $slotStart)
+            ->where(function ($q) {
+                $q->whereNull('client_email')
+                    ->orWhere('client_email', '!=', 'desk@waw.local');
+            })
+            ->where('client_name', 'not like', 'Desk ·%')
+            ->exists();
     }
 
     protected function isRoomFreeOnAgenda(string $date, string $timeSlot, int $roomNumber): bool
@@ -197,6 +245,39 @@ class AgendaClient
             return true;
         } catch (Throwable $e) {
             Log::warning('Agenda status push error', [
+                'id' => $agendaBookingId,
+                'error' => $e->getMessage(),
+            ]);
+
+            return false;
+        }
+    }
+
+    public function updateRoomNumber(string $agendaBookingId, int $roomNumber): bool
+    {
+        if (! $this->isConfigured() || $agendaBookingId === '') {
+            return false;
+        }
+
+        try {
+            $response = $this->http()->patch(
+                $this->baseUrl().'/api/bookings/'.$agendaBookingId,
+                ['roomNumber' => max(1, min(2, $roomNumber))]
+            );
+
+            if (! $response->successful()) {
+                Log::warning('Agenda room switch failed', [
+                    'id' => $agendaBookingId,
+                    'status' => $response->status(),
+                    'body' => $response->body(),
+                ]);
+
+                return false;
+            }
+
+            return true;
+        } catch (Throwable $e) {
+            Log::warning('Agenda room switch error', [
                 'id' => $agendaBookingId,
                 'error' => $e->getMessage(),
             ]);

@@ -20,7 +20,14 @@ function formatDayLabel(dateStr) {
 }
 
 export default function HistoryModal({ open, onClose }) {
-    const todayStr = new Date().toISOString().split('T')[0];
+    const todayStr = (() => {
+        const now = new Date();
+        const y = now.getFullYear();
+        const m = String(now.getMonth() + 1).padStart(2, '0');
+        const d = String(now.getDate()).padStart(2, '0');
+        return `${y}-${m}-${d}`;
+    })();
+
     const [loading, setLoading] = useState(true);
     const [selectedDate, setSelectedDate] = useState(todayStr);
     const [data, setData] = useState({
@@ -39,6 +46,7 @@ export default function HistoryModal({ open, onClose }) {
     });
     const [dailyDays, setDailyDays] = useState([]);
     const [tab, setTab] = useState('entered');
+    const [cancelFilter, setCancelFilter] = useState('all'); // all | staff | web
 
     useEffect(() => {
         if (!open) return;
@@ -91,15 +99,33 @@ export default function HistoryModal({ open, onClose }) {
             .finally(() => setLoading(false));
     }, [open, selectedDate]);
 
+    useEffect(() => {
+        if (tab !== 'cancelled') setCancelFilter('all');
+    }, [tab]);
+
     const totals = data.totals || {};
     const byMethod = totals.byMethod || { cash: 0, debit_card: 0, carte: 0 };
 
+    const cancelCounts = useMemo(() => {
+        const staff = data.cancelled.filter((i) => i.cancelSource === 'staff').length;
+        const web = data.cancelled.filter((i) => i.cancelSource === 'web').length;
+        return { all: data.cancelled.length, staff, web };
+    }, [data.cancelled]);
+
     const list = useMemo(() => {
         if (tab === 'entered') return data.entered;
-        if (tab === 'cancelled') return data.cancelled;
         if (tab === 'noshow') return data.noShows;
+        if (tab === 'cancelled') {
+            if (cancelFilter === 'staff') {
+                return data.cancelled.filter((i) => i.cancelSource === 'staff');
+            }
+            if (cancelFilter === 'web') {
+                return data.cancelled.filter((i) => i.cancelSource === 'web');
+            }
+            return data.cancelled;
+        }
         return [];
-    }, [tab, data]);
+    }, [tab, data, cancelFilter]);
 
     if (!open) return null;
 
@@ -114,6 +140,7 @@ export default function HistoryModal({ open, onClose }) {
                         <h2 className="text-xl font-semibold tracking-tight text-[#111]">Session history</h2>
                     </div>
                     <button
+                        type="button"
                         onClick={onClose}
                         className="rounded-lg px-2 py-1 text-[#6B6B6B] transition hover:bg-[#F7F4EC] hover:text-[#111]"
                     >
@@ -135,6 +162,9 @@ export default function HistoryModal({ open, onClose }) {
                     >
                         Today
                     </button>
+                    <span className="text-xs font-medium text-[#6B6B6B]">
+                        {formatDayLabel(selectedDate)}
+                    </span>
                 </div>
 
                 <div className="mb-3 flex flex-wrap gap-2">
@@ -146,6 +176,7 @@ export default function HistoryModal({ open, onClose }) {
                     ].map((t) => (
                         <button
                             key={t.id}
+                            type="button"
                             onClick={() => setTab(t.id)}
                             className={`rounded-lg px-3 py-2 text-sm font-semibold transition ${
                                 tab === t.id
@@ -158,7 +189,46 @@ export default function HistoryModal({ open, onClose }) {
                     ))}
                 </div>
 
-                {tab !== 'daily' && !loading && (
+                {tab === 'cancelled' && !loading && (
+                    <>
+                        <div className="mb-3 flex flex-wrap gap-2">
+                            {[
+                                { id: 'all', label: `All (${cancelCounts.all})` },
+                                { id: 'staff', label: `Staff / desk (${cancelCounts.staff})` },
+                                { id: 'web', label: `Web (${cancelCounts.web})` },
+                            ].map((t) => (
+                                <button
+                                    key={t.id}
+                                    type="button"
+                                    onClick={() => setCancelFilter(t.id)}
+                                    className={`rounded-lg px-3 py-2 text-sm font-semibold transition ${
+                                        cancelFilter === t.id
+                                            ? 'bg-[#111] text-white'
+                                            : 'border border-[#E8E4D9] bg-white text-[#111] hover:bg-[#F7F4EC]'
+                                    }`}
+                                >
+                                    {t.label}
+                                </button>
+                            ))}
+                        </div>
+                        <div className="mb-4 grid grid-cols-2 gap-2">
+                            <div className="rounded-xl border border-[#E8E4D9] bg-white p-3 text-center">
+                                <div className="text-[10px] font-semibold uppercase tracking-wide text-[#6B6B6B]">
+                                    Cancelled by staff
+                                </div>
+                                <div className="text-lg font-semibold text-[#111]">{cancelCounts.staff}</div>
+                            </div>
+                            <div className="rounded-xl border border-[#E8E4D9] bg-white p-3 text-center">
+                                <div className="text-[10px] font-semibold uppercase tracking-wide text-[#6B6B6B]">
+                                    Cancelled on web
+                                </div>
+                                <div className="text-lg font-semibold text-[#111]">{cancelCounts.web}</div>
+                            </div>
+                        </div>
+                    </>
+                )}
+
+                {tab !== 'daily' && tab !== 'cancelled' && !loading && (
                     <div className="mb-4 space-y-2">
                         <div className="grid grid-cols-3 gap-2 rounded-xl border border-[#E8E4D9] bg-[#F7F4EC] p-3">
                             <div className="text-center">
@@ -271,11 +341,16 @@ export default function HistoryModal({ open, onClose }) {
                     )}
 
                     {!loading && tab !== 'daily' && list.length === 0 && (
-                        <p className="text-sm text-[#6B6B6B]">Nothing here for this day.</p>
+                        <p className="text-sm text-[#6B6B6B]">
+                            {tab === 'cancelled'
+                                ? 'No cancellations for this day.'
+                                : 'Nothing here for this day.'}
+                        </p>
                     )}
 
                     {!loading &&
                         tab !== 'daily' &&
+                        tab !== 'cancelled' &&
                         list.map((item) => {
                             const price = Number(item.totalPrice) || 0;
                             const methodLabel = item.isComplimentary
@@ -288,7 +363,7 @@ export default function HistoryModal({ open, onClose }) {
                                 <div
                                     key={item.id}
                                     className={`rounded-xl border p-3 ${
-                                        tab === 'cancelled' || tab === 'noshow'
+                                        tab === 'noshow'
                                             ? 'border-[#F5D0C8] bg-[#FFF5F3]'
                                             : 'border-[#E8E4D9] bg-white'
                                     }`}
@@ -321,29 +396,67 @@ export default function HistoryModal({ open, onClose }) {
                                                     No-show · not billed
                                                 </div>
                                             )}
-                                            {tab === 'cancelled' && (
-                                                <div className="mt-1 space-y-0.5">
-                                                    <div className="text-[10px] font-semibold uppercase tracking-wide text-[#B42318]">
-                                                        {item.cancelLabel ||
-                                                            (item.cancelSource === 'web'
-                                                                ? 'Cancelled on web'
-                                                                : 'Cancelled by staff')}
-                                                    </div>
-                                                    <div className="text-[10px] font-medium text-[#6B6B6B]">
-                                                        {item.bookedLabel ||
-                                                            (item.bookedVia === 'web'
-                                                                ? 'Booked online'
-                                                                : 'Booked at desk')}
-                                                        {item.cancelledAt ? ` · ${item.cancelledAt}` : ''}
-                                                    </div>
-                                                </div>
-                                            )}
                                         </div>
                                         <div className="text-right font-mono text-xs font-medium text-[#444]">
                                             {item.start} – {item.end}
                                             {tab === 'entered' && item.status === 'in_progress' && (
                                                 <div className="mt-1 font-sans text-[#8A7400]">
                                                     Currently in room
+                                                </div>
+                                            )}
+                                        </div>
+                                    </div>
+                                </div>
+                            );
+                        })}
+
+                    {!loading &&
+                        tab === 'cancelled' &&
+                        list.map((item) => {
+                            const isWeb = item.cancelSource === 'web';
+                            return (
+                                <div
+                                    key={item.id}
+                                    className="rounded-xl border border-[#F5D0C8] bg-[#FFF5F3] p-3"
+                                >
+                                    <div className="flex items-start justify-between gap-3">
+                                        <div className="min-w-0">
+                                            <div className="font-semibold capitalize text-[#111]">
+                                                {item.clientName}
+                                            </div>
+                                            <div className="text-xs text-[#6B6B6B]">
+                                                {item.roomName}
+                                                {item.members ? ` · ${item.members} guests` : ''}
+                                                {item.clientPhone ? ` · ${item.clientPhone}` : ''}
+                                            </div>
+                                            <div className="mt-2 flex flex-wrap gap-1.5">
+                                                <span
+                                                    className={`inline-flex rounded-md px-1.5 py-0.5 text-[10px] font-semibold ${
+                                                        isWeb
+                                                            ? 'bg-[#111] text-white'
+                                                            : 'bg-[#B42318] text-white'
+                                                    }`}
+                                                >
+                                                    {item.cancelLabel ||
+                                                        (isWeb
+                                                            ? 'Cancelled on web'
+                                                            : 'Cancelled by staff')}
+                                                </span>
+                                                <span className="inline-flex rounded-md border border-[#E8E4D9] bg-white px-1.5 py-0.5 text-[10px] font-semibold text-[#6B6B6B]">
+                                                    {item.bookedLabel ||
+                                                        (item.bookedVia === 'web'
+                                                            ? 'Booked online'
+                                                            : 'Booked at desk')}
+                                                </span>
+                                            </div>
+                                        </div>
+                                        <div className="shrink-0 text-right font-mono text-xs font-medium text-[#444]">
+                                            <div>
+                                                {item.start} – {item.end}
+                                            </div>
+                                            {item.cancelledAt && (
+                                                <div className="mt-1 font-sans text-[10px] font-semibold uppercase tracking-wide text-[#B42318]">
+                                                    at {item.cancelledAt}
                                                 </div>
                                             )}
                                         </div>
