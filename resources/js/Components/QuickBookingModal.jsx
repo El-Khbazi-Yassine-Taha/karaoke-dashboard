@@ -343,7 +343,7 @@ export default function QuickBookingModal({ open, onClose, rooms, selectedRoomId
                 invited_by: isComplimentary ? invitedBy : null,
             },
             {
-                ...deskVisit,
+                ...deskVisit(),
                 onSuccess: () => {
                     setClientName('');
                     setClientPhone('');

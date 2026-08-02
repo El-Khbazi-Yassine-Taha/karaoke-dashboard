@@ -20,7 +20,9 @@ class SyncAgendaBookings extends Command
         }
 
         $date = $this->option('date') ?: null;
-        $count = $agenda->syncReservations($date);
+        $count = $date
+            ? $agenda->syncReservations($date)
+            : $agenda->syncUpcomingDays();
         $this->info("Synced {$count} reservation(s) from agenda-waw.");
 
         return self::SUCCESS;

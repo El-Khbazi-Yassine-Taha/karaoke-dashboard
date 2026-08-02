@@ -7,7 +7,7 @@ import HistoryModal from '../Components/HistoryModal';
 import KaraokeBackground from '../Components/KaraokeBackground';
 import AgendaView from '@/Components/AgendaView';
 import ErrorBoundary from '../Components/ErrorBoundary';
-import { DASHBOARD_ONLY } from '../lib/deskVisit';
+import { DASHBOARD_ONLY, isDeskMutating } from '../lib/deskVisit';
 
 export default function Dashboard({
     rooms = [],
@@ -27,6 +27,8 @@ export default function Dashboard({
 
     useEffect(() => {
         const interval = window.setInterval(() => {
+            // Never let a background poll finish after checkout and paint LIVE again
+            if (isDeskMutating()) return;
             try {
                 router.reload({
                     only: DASHBOARD_ONLY,
@@ -36,7 +38,7 @@ export default function Dashboard({
             } catch (err) {
                 console.error('[dashboard poll]', err);
             }
-        }, 60000);
+        }, 20000);
         return () => window.clearInterval(interval);
     }, []);
 

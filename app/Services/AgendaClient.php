@@ -22,10 +22,13 @@ class AgendaClient
 
     /**
      * Short timeouts so the staff desk never waits on a cold Vercel function.
+     * Sync pulls use a longer budget so tomorrow’s bookings aren’t dropped on cold starts.
      */
-    protected function http()
+    protected function http(bool $forSync = false)
     {
-        $request = Http::connectTimeout(0.8)->timeout(1.5)->acceptJson();
+        $request = $forSync
+            ? Http::connectTimeout(2)->timeout(4)->acceptJson()
+            : Http::connectTimeout(0.5)->timeout(1.2)->acceptJson();
         $apiKey = config('services.agenda.key', env('AGENDA_API_KEY'));
         $pin = config('services.agenda.pin', env('AGENDA_ADMIN_PIN', 'waw2026'));
 
@@ -195,7 +198,7 @@ class AgendaClient
                 $url .= '?date='.urlencode($date);
             }
 
-            $response = $this->http()->get($url);
+            $response = $this->http(true)->get($url);
             if (! $response->successful()) {
                 Log::warning('Agenda sync failed', [
                     'status' => $response->status(),
@@ -442,6 +445,47 @@ class AgendaClient
         };
     }
 
+    /** +2120… → +212… (Morocco trunk 0 must not follow country code). */
+    protected function normalizePhone(string $raw): string
+    {
+        $trimmed = trim($raw);
+        if ($trimmed === '') {
+            return $trimmed;
+        }
+
+        $digits = preg_replace('/\D+/', '', $trimmed) ?? '';
+        if ($digits === '') {
+            return $trimmed;
+        }
+
+        if (str_starts_with($digits, '212')) {
+            $national = ltrim(substr($digits, 3), '0');
+
+            return '+212'.$national;
+        }
+
+        if (preg_match('/^\+(\d{1,3})0+(\d+)$/', $trimmed, $m)) {
+            return '+'.$m[1].$m[2];
+        }
+
+        return $trimmed;
+    }
+
+    /**
+     * Pull web bookings day-by-day (today ± range) so Vercel cold starts don’t time out.
+     */
+    public function syncUpcomingDays(int $fromOffset = 0, int $days = 2): int
+    {
+        $synced = 0;
+        $start = Carbon::today()->addDays($fromOffset);
+
+        for ($i = 0; $i < $days; $i++) {
+            $synced += $this->syncReservations($start->copy()->addDays($i)->format('Y-m-d'));
+        }
+
+        return $synced;
+    }
+
     /**
      * Pull web bookings into local reservations table for the staff agenda.
      */
@@ -487,7 +531,7 @@ class AgendaClient
                     $payload = [
                         'room_name' => 'Room '.$roomNumber,
                         'client_name' => (string) ($booking['clientName'] ?? 'Client web'),
-                        'client_phone' => (string) ($booking['phone'] ?? ''),
+                        'client_phone' => $this->normalizePhone((string) ($booking['phone'] ?? '')),
                         'client_email' => (string) ($booking['email'] ?? ''),
                         'members_count' => max(1, (int) ($booking['participants'] ?? 1)),
                         'total_price' => isset($booking['totalPrice']) ? (int) $booking['totalPrice'] : null,
@@ -547,7 +591,7 @@ class AgendaClient
                     [
                         'room_name' => $roomName,
                         'client_name' => (string) ($booking['clientName'] ?? 'Client web'),
-                        'client_phone' => (string) ($booking['phone'] ?? ''),
+                        'client_phone' => $this->normalizePhone((string) ($booking['phone'] ?? '')),
                         'client_email' => (string) ($booking['email'] ?? ''),
                         'members_count' => max(1, (int) ($booking['participants'] ?? 1)),
                         'total_price' => isset($booking['totalPrice']) ? (int) $booking['totalPrice'] : null,

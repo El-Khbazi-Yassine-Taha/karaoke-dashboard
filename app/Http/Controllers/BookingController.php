@@ -342,8 +342,17 @@ class BookingController extends Controller
     {
         $roomId = $booking->room_id;
         $now = Carbon::now();
+
+        // Already ended — just heal the schedule so the desk clears
+        if (in_array($booking->status, ['completed', 'cancelled', 'no_show'], true)) {
+            self::repairRoomSchedule($roomId);
+
+            return redirect()->back();
+        }
+
         $plannedEnd = Carbon::parse($booking->end_time);
         // More than ~1 minute left → treat as admin early end (cancellation)
+        // Ending-soon (last 60s) always counts as a normal completed session.
         $endedEarly = $now->lt($plannedEnd->copy()->subMinute());
 
         if ($endedEarly) {

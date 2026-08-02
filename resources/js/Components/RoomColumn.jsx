@@ -2,7 +2,7 @@ import { useState, useEffect, useLayoutEffect, useRef, useMemo } from 'react';
 import { createPortal } from 'react-dom';
 import { router } from '@inertiajs/react';
 import SessionRingTimer from './SessionRingTimer';
-import { deskVisit } from '../lib/deskVisit';
+import { deskPost, deskVisit } from '../lib/deskVisit';
 
 function localDateStr() {
     const n = new Date();
@@ -309,7 +309,11 @@ function OverflowMenu({ open, onToggle, items }) {
 
 export default function RoomColumn({ room, rooms = [], onOpenBooking }) {
     const otherRoom = (rooms || []).find((r) => String(r.id) !== String(room.id));
-    const isOccupied = room.state === 'occupied';
+    const serverOccupied = room.state === 'occupied';
+    // Hide LIVE immediately after checkout so a slow/stale poll cannot flash the old session
+    const [checkingOutId, setCheckingOutId] = useState(null);
+    const isOccupied =
+        serverOccupied && String(room.bookingId ?? '') !== String(checkingOutId ?? '');
     const isAwaitingPayment = room.state === 'awaiting_payment' || Boolean(room.awaitingPayment);
 
     const serverPaid = toBool(room.currentClientPaid ?? room.is_paid ?? room.paid);
@@ -351,8 +355,24 @@ export default function RoomColumn({ room, rooms = [], onOpenBooking }) {
     }, [room.bookingId]);
 
     useEffect(() => {
-        if (!isOccupied) {
+        if (!serverOccupied) {
+            setCheckingOutId(null);
             setAlarmSilenced(false);
+            stopContinuousAlarm();
+            return;
+        }
+        // A different session replaced the one we just checked out
+        if (
+            checkingOutId != null &&
+            room.bookingId != null &&
+            String(room.bookingId) !== String(checkingOutId)
+        ) {
+            setCheckingOutId(null);
+        }
+    }, [serverOccupied, room.bookingId, checkingOutId]);
+
+    useEffect(() => {
+        if (!isOccupied) {
             stopContinuousAlarm();
         }
     }, [isOccupied]);
@@ -396,7 +416,7 @@ export default function RoomColumn({ room, rooms = [], onOpenBooking }) {
         // Web reservation due → create booking + start timer after payment choice
         if (isAwaitingPayment && room.reservationId) {
             router.post(`/reservations/${room.reservationId}/start-session`, payload, {
-                ...deskVisit,
+                ...deskVisit(),
             });
             return;
         }
@@ -404,13 +424,13 @@ export default function RoomColumn({ room, rooms = [], onOpenBooking }) {
         // Local walk-in pending payment → start timer after payment choice
         if (isAwaitingPayment && room.bookingId) {
             router.post(`/bookings/${room.bookingId}/start-session`, payload, {
-                ...deskVisit,
+                ...deskVisit(),
             });
             return;
         }
 
         if (!room.bookingId) return;
-        router.post(`/bookings/${room.bookingId}/toggle-paid`, payload, deskVisit);
+        router.post(`/bookings/${room.bookingId}/toggle-paid`, payload, deskVisit());
     }
 
     function openMarkPaid(bookingId) {
@@ -429,7 +449,7 @@ export default function RoomColumn({ room, rooms = [], onOpenBooking }) {
         router.post(
             `/bookings/${id}/toggle-paid`,
             { paid: 1, payment_method: method },
-            deskVisit
+            deskVisit()
         );
     }
 
@@ -437,7 +457,7 @@ export default function RoomColumn({ room, rooms = [], onOpenBooking }) {
         if (!/^\d+$/.test(String(bookingId))) return;
         const isCurrent = String(bookingId) === String(room.bookingId);
         if (isCurrent) setLocalPaid(false);
-        router.post(`/bookings/${bookingId}/toggle-paid`, { paid: 0 }, deskVisit);
+        router.post(`/bookings/${bookingId}/toggle-paid`, { paid: 0 }, deskVisit());
     }
 
     function checkIn(bookingId) {
@@ -477,7 +497,7 @@ export default function RoomColumn({ room, rooms = [], onOpenBooking }) {
         setUnpaidConfirmStep(false);
         setPaymentMethodPick(null);
 
-        router.post(`/bookings/${id}/start-session`, payload, deskVisit);
+        router.post(`/bookings/${id}/start-session`, payload, deskVisit());
     }
 
     function closeCheckInPayment() {
@@ -573,26 +593,26 @@ export default function RoomColumn({ room, rooms = [], onOpenBooking }) {
         setActionConfirm(null);
 
         if (type === 'no_show' && kind === 'booking') {
-            router.post(`/bookings/${id}/no-show`, {}, deskVisit);
+            router.post(`/bookings/${id}/no-show`, {}, deskVisit());
             return;
         }
         if (type === 'no_show' && kind === 'reservation') {
-            router.post(`/reservations/${id}/no-show`, {}, deskVisit);
+            router.post(`/reservations/${id}/no-show`, {}, deskVisit());
             return;
         }
         if (type === 'cancel' && kind === 'booking') {
-            router.post(`/bookings/${id}/cancel`, {}, deskVisit);
+            router.post(`/bookings/${id}/cancel`, {}, deskVisit());
             return;
         }
         if (type === 'cancel' && kind === 'reservation') {
-            router.post(`/reservations/${id}/cancel`, {}, deskVisit);
+            router.post(`/reservations/${id}/cancel`, {}, deskVisit());
             return;
         }
         if (type === 'switch_room' && kind === 'booking' && targetRoomId) {
             router.post(
                 `/bookings/${id}/switch-room`,
                 { room_id: targetRoomId },
-                deskVisit
+                deskVisit()
             );
             return;
         }
@@ -600,7 +620,7 @@ export default function RoomColumn({ room, rooms = [], onOpenBooking }) {
             router.post(
                 `/reservations/${id}/switch-room`,
                 { room_id: targetRoomId },
-                deskVisit
+                deskVisit()
             );
         }
     }
@@ -672,7 +692,14 @@ export default function RoomColumn({ room, rooms = [], onOpenBooking }) {
         autoCheckoutFiredForBooking.current = room.bookingId;
         stopContinuousAlarm();
         setAlarmSilenced(true);
-        router.post(`/bookings/${room.bookingId}/checkout`, {}, deskVisit);
+        setCheckingOutId(room.bookingId);
+        deskPost(`/bookings/${room.bookingId}/checkout`, {}, {
+            onError: () => {
+                setCheckingOutId(null);
+                autoCheckoutFiredForBooking.current = null;
+            },
+            onFinish: () => stopContinuousAlarm(),
+        });
     }, [isOccupied, room.bookingId, secondsLeft]);
 
     useEffect(() => {
@@ -705,23 +732,35 @@ export default function RoomColumn({ room, rooms = [], onOpenBooking }) {
         };
     }, [showUrgentAlert, room.name]);
 
-    function checkoutNow() {
+    function performCheckout() {
         if (!room.bookingId) return;
-        stopContinuousAlarm();
-        setAlarmSilenced(true);
-        setCheckoutConfirmOpen(true);
-        setPaymentConfirmOpen(false);
-    }
-
-    function confirmCheckout() {
-        if (!room.bookingId) return;
+        const id = room.bookingId;
         stopContinuousAlarm();
         setAlarmSilenced(true);
         setCheckoutConfirmOpen(false);
-        router.post(`/bookings/${room.bookingId}/checkout`, {}, {
-            ...deskVisit,
+        setPaymentConfirmOpen(false);
+        setCheckingOutId(id);
+        deskPost(`/bookings/${id}/checkout`, {}, {
+            onError: () => setCheckingOutId(null),
             onFinish: () => stopContinuousAlarm(),
         });
+    }
+
+    /** Ending-soon / time-up: check out immediately. Otherwise ask for confirm. */
+    function checkoutNow({ urgent = false } = {}) {
+        if (!room.bookingId) return;
+        stopContinuousAlarm();
+        setAlarmSilenced(true);
+        setPaymentConfirmOpen(false);
+        if (urgent || secondsLeft <= 60) {
+            performCheckout();
+            return;
+        }
+        setCheckoutConfirmOpen(true);
+    }
+
+    function confirmCheckout() {
+        performCheckout();
     }
 
     function togglePaid(bookingId, nextPaid = null) {
@@ -736,7 +775,7 @@ export default function RoomColumn({ room, rooms = [], onOpenBooking }) {
 
     function pushBooking(bookingId, minutes) {
         if (!/^\d+$/.test(String(bookingId))) return;
-        router.post(`/bookings/${bookingId}/delay`, { minutes }, deskVisit);
+        router.post(`/bookings/${bookingId}/delay`, { minutes }, deskVisit());
     }
 
     function openEditModal() {
@@ -768,7 +807,7 @@ export default function RoomColumn({ room, rooms = [], onOpenBooking }) {
         router.post(
             `/bookings/${room.bookingId}/extend`,
             { minutes },
-            deskVisit
+            deskVisit()
         );
     }
 
@@ -797,7 +836,7 @@ export default function RoomColumn({ room, rooms = [], onOpenBooking }) {
                 start_clock_time: editStartTime,
                 duration_minutes: editDuration,
             },
-            { ...deskVisit, onSuccess: () => setIsEditingActive(false) }
+            { ...deskVisit(), onSuccess: () => setIsEditingActive(false) }
         );
     }
 
@@ -814,7 +853,7 @@ export default function RoomColumn({ room, rooms = [], onOpenBooking }) {
 
         if (isDeskBooking(editingBooking)) {
             router.post(`/bookings/${editingBooking.id}/update`, payload, {
-                ...deskVisit,
+                ...deskVisit(),
                 onSuccess: () => setEditingBooking(null),
             });
             return;
@@ -824,7 +863,7 @@ export default function RoomColumn({ room, rooms = [], onOpenBooking }) {
         if (!reservationId) return;
 
         router.post(`/reservations/${reservationId}/update`, payload, {
-            ...deskVisit,
+            ...deskVisit(),
             onSuccess: () => setEditingBooking(null),
         });
     }
@@ -1252,7 +1291,7 @@ export default function RoomColumn({ room, rooms = [], onOpenBooking }) {
                     </p>
                     <button
                         type="button"
-                        onClick={checkoutNow}
+                        onClick={() => checkoutNow({ urgent: true })}
                         className="btn-waw min-w-[12rem] shadow-[0_0_24px_rgba(255,212,0,0.55)]"
                     >
                         Check out now
@@ -1511,7 +1550,11 @@ export default function RoomColumn({ room, rooms = [], onOpenBooking }) {
                         New booking
                     </button>
                     {isOccupied && (
-                        <button onClick={checkoutNow} className="btn-waw flex-1">
+                        <button
+                            type="button"
+                            onClick={() => checkoutNow()}
+                            className="btn-waw flex-1"
+                        >
                             Check out
                         </button>
                     )}

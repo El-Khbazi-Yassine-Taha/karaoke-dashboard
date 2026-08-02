@@ -11,6 +11,7 @@ use Illuminate\Http\JsonResponse;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Http\Request;
 use Inertia\Inertia;
 use Inertia\Response;
 
@@ -22,11 +23,17 @@ class DashboardController extends Controller
     ) {
     }
 
-    public function index(): Response
+    public function index(Request $request): Response
     {
-        $this->syncAgendaQuietly();
+        // Partial reloads (every desk click) must stay local+fast.
+        // Full page load may pull web reservations in the background.
+        $isPartial = $request->header('X-Inertia-Partial-Data') !== null;
 
-        $payload = array_merge($this->availability->getDashboardPayload(true), [
+        if (! $isPartial) {
+            $this->syncAgendaQuietly();
+        }
+
+        $payload = array_merge($this->availability->getDashboardPayload(! $isPartial), [
             'reservations' => $this->reservationsPayload(),
         ]);
 
@@ -78,14 +85,23 @@ class DashboardController extends Controller
 
     private function reservationsPayload(): array
     {
+        $from = Carbon::today()->subDay()->startOfDay();
+        $to = Carbon::today()->addDays(14)->endOfDay();
+
+        // Agenda = web reservations only (desk walk-ins stay in Up next / room columns).
         return Reservation::query()
+            ->where(function ($q) {
+                $q->where('source', 'agenda-waw')
+                    ->orWhereNotNull('agenda_booking_id');
+            })
             ->where(function ($q) {
                 $q->whereNull('client_email')
                     ->orWhere('client_email', '!=', 'desk@waw.local');
             })
             ->where('client_name', 'not like', 'Desk ·%')
             ->whereNotIn('status', ['cancelled', 'no_show'])
-            ->whereDate('date', '>=', Carbon::today()->subDay())
+            ->whereDate('date', '>=', $from->toDateString())
+            ->whereDate('date', '<=', $to->toDateString())
             ->orderBy('check_in', 'asc')
             ->get()
             ->map(function (Reservation $res) {
@@ -102,7 +118,7 @@ class DashboardController extends Controller
                     'check_out' => optional($res->check_out)->format('Y-m-d H:i:s'),
                     'date' => optional($res->date)->format('Y-m-d'),
                     'status' => $res->status,
-                    'source' => $res->source,
+                    'source' => 'agenda-waw',
                     'agenda_booking_id' => $res->agenda_booking_id,
                 ];
             })
@@ -111,15 +127,17 @@ class DashboardController extends Controller
 
     private function syncAgendaQuietly(): void
     {
-        // Never block the dashboard HTML/JSON on Vercel — sync after the response.
+        // Never block the dashboard — sync after the response, and keep it small
+        // so php artisan serve isn’t busy for the next click.
         if (Cache::has('agenda-sync-throttle')) {
             return;
         }
 
-        Cache::put('agenda-sync-throttle', true, 45);
+        Cache::put('agenda-sync-throttle', true, 30);
 
         $this->agenda->defer(function (AgendaClient $agenda) {
-            $agenda->syncReservations();
+            // Today + tomorrow only (not a full week of Vercel round-trips).
+            $agenda->syncUpcomingDays(0, 2);
         });
     }
 }

@@ -1,4 +1,5 @@
 import React, { useMemo, useState } from 'react';
+import { formatPhoneDisplay } from '../lib/formatPhone';
 
 const DAY_START_HOUR = 12;
 const DAY_END_HOUR = 22;
@@ -202,7 +203,7 @@ export default function AgendaView({ reservations = [], rooms = [] }) {
             {selected && (
                 <div className="grid gap-3 border-b-2 border-black bg-[#F7F4EC] px-4 py-3.5 sm:grid-cols-5 sm:px-5">
                     <Detail label="Guest" value={selected.client_name || '—'} />
-                    <Detail label="Phone" value={selected.client_phone || '—'} />
+                    <Detail label="Phone" value={formatPhoneDisplay(selected.client_phone)} />
                     <Detail label="Email" value={selected.client_email || '—'} />
                     <Detail label="Party" value={`${Number(selected.members_count) || 1}`} />
                     <Detail
