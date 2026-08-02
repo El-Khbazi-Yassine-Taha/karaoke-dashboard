@@ -717,7 +717,7 @@ class BookingController extends Controller
         $clientName = $request->input('client_name') ?? $request->input('clientName');
         $startClockTime = $request->input('start_clock_time') ?? $request->input('startTime');
         $duration = (int) ($request->input('duration_minutes') ?? $request->input('durationMinutes', 60));
-        $duration = max(0, min(100, $duration));
+        $duration = max(1, min(1440, $duration));
 
         $now = Carbon::now();
         $todayDate = $now->format('Y-m-d');

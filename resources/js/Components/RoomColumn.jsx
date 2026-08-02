@@ -120,15 +120,18 @@ function showBrowserNotification(roomName, clientName, { silent = false } = {}) 
 /** Looping alarm — keeps beeping while the overlay is up (also tries when tab is hidden). */
 function startContinuousAlarm(roomName, clientName) {
     stopContinuousAlarm();
+    try {
+        if (sharedAudioCtx && sharedAudioCtx.state === 'suspended') {
+            sharedAudioCtx.resume().catch(() => {});
+        }
+    } catch (e) {}
     playEmergencyAlarm();
     showBrowserNotification(roomName, clientName);
 
     continuousAlarmTimer = window.setInterval(() => {
-        // WebAudio may be throttled in background tabs — still try
         playEmergencyAlarm();
     }, 900);
 
-    // System notifications still alert when the staff is on another tab
     backgroundNotifTimer = window.setInterval(() => {
         if (document.visibilityState === 'hidden') {
             showBrowserNotification(roomName, clientName, { silent: false });
@@ -145,6 +148,12 @@ function stopContinuousAlarm() {
         clearInterval(backgroundNotifTimer);
         backgroundNotifTimer = null;
     }
+    // Kill any in-flight beep so silence is instant after checkout
+    try {
+        if (sharedAudioCtx && sharedAudioCtx.state === 'running') {
+            sharedAudioCtx.suspend().catch(() => {});
+        }
+    } catch (e) {}
 }
 
 function calculatePrice(members) {
@@ -328,11 +337,25 @@ export default function RoomColumn({ room, rooms = [], onOpenBooking }) {
     const [checkInTarget, setCheckInTarget] = useState(null);
     const [checkoutConfirmOpen, setCheckoutConfirmOpen] = useState(false);
     const [actionConfirm, setActionConfirm] = useState(null);
+    // Stops alarm as soon as staff starts checkout — even before the server responds
+    const [alarmSilenced, setAlarmSilenced] = useState(false);
     const confirmedBookingsRef = useRef(new Set());
     const [openMenu, setOpenMenu] = useState(null);
 
     const isComplimentary = toBool(room.isComplimentary);
     const paymentMethod = room.paymentMethod || null;
+
+    useEffect(() => {
+        // New live booking → allow alerts again
+        setAlarmSilenced(false);
+    }, [room.bookingId]);
+
+    useEffect(() => {
+        if (!isOccupied) {
+            setAlarmSilenced(false);
+            stopContinuousAlarm();
+        }
+    }, [isOccupied]);
 
     // Walk-in or due web reservation: show payment picker (timer not started yet)
     useEffect(() => {
@@ -623,7 +646,12 @@ export default function RoomColumn({ room, rooms = [], onOpenBooking }) {
 
     const secondsLeft = Math.floor(msRemaining / 1000);
     const showUrgentAlert =
-        isOccupied && secondsLeft <= 60 && !paymentConfirmOpen && !checkoutConfirmOpen && !actionConfirm;
+        isOccupied &&
+        secondsLeft <= 60 &&
+        !paymentConfirmOpen &&
+        !checkoutConfirmOpen &&
+        !actionConfirm &&
+        !alarmSilenced;
 
     // Optimistic due-guest UI handles handoff — do NOT auto-reload here (caused yellow blank page).
     const prevFreeMsRef = useRef(null);
@@ -642,6 +670,8 @@ export default function RoomColumn({ room, rooms = [], onOpenBooking }) {
         if (prev == null || prev <= 0) return;
         if (autoCheckoutFiredForBooking.current === room.bookingId) return;
         autoCheckoutFiredForBooking.current = room.bookingId;
+        stopContinuousAlarm();
+        setAlarmSilenced(true);
         router.post(`/bookings/${room.bookingId}/checkout`, {}, deskVisit);
     }, [isOccupied, room.bookingId, secondsLeft]);
 
@@ -677,14 +707,21 @@ export default function RoomColumn({ room, rooms = [], onOpenBooking }) {
 
     function checkoutNow() {
         if (!room.bookingId) return;
+        stopContinuousAlarm();
+        setAlarmSilenced(true);
         setCheckoutConfirmOpen(true);
         setPaymentConfirmOpen(false);
     }
 
     function confirmCheckout() {
         if (!room.bookingId) return;
+        stopContinuousAlarm();
+        setAlarmSilenced(true);
         setCheckoutConfirmOpen(false);
-        router.post(`/bookings/${room.bookingId}/checkout`, {}, deskVisit);
+        router.post(`/bookings/${room.bookingId}/checkout`, {}, {
+            ...deskVisit,
+            onFinish: () => stopContinuousAlarm(),
+        });
     }
 
     function togglePaid(bookingId, nextPaid = null) {
@@ -768,7 +805,7 @@ export default function RoomColumn({ room, rooms = [], onOpenBooking }) {
         e.preventDefault();
         if (!editingBooking?.id) return;
 
-        const mins = Math.max(0, Math.min(100, Number(editBookingDuration) || 0));
+        const mins = Math.max(1, Math.min(1440, Number(editBookingDuration) || 60));
         const payload = {
             client_name: editBookingName,
             start_clock_time: editBookingStartTime,
@@ -1707,10 +1744,9 @@ export default function RoomColumn({ room, rooms = [], onOpenBooking }) {
                                     ))}
                                     <input
                                         type="number"
-                                        min={0}
-                                        max={100}
+                                        min={1}
                                         step={1}
-                                        placeholder="0–100"
+                                        placeholder="Custom min"
                                         value={
                                             [30, 60, 90, 120, 150, 180].includes(Number(editDuration))
                                                 ? ''
@@ -1724,13 +1760,13 @@ export default function RoomColumn({ room, rooms = [], onOpenBooking }) {
                                             }
                                             const n = parseInt(v, 10);
                                             if (!Number.isFinite(n)) return;
-                                            setEditDuration(Math.max(0, Math.min(100, n)));
+                                            setEditDuration(Math.max(1, n));
                                         }}
                                         className="w-[7.5rem] rounded-lg border-2 border-black bg-white px-2 py-1.5 text-xs font-bold text-black outline-none focus:bg-[#FFD400]/30"
                                     />
                                 </div>
                                 <p className="mt-1.5 text-[11px] font-semibold text-black/45">
-                                    Or type any minutes (0–100)
+                                    Or type any minutes you want
                                 </p>
                                 <p className="mt-2 text-[12px] font-bold text-black">
                                     Ends at{' '}
@@ -1800,10 +1836,9 @@ export default function RoomColumn({ room, rooms = [], onOpenBooking }) {
                                     ))}
                                     <input
                                         type="number"
-                                        min={0}
-                                        max={100}
+                                        min={1}
                                         step={1}
-                                        placeholder="0–100"
+                                        placeholder="Custom min"
                                         value={
                                             [30, 60, 90, 120].includes(Number(editBookingDuration))
                                                 ? ''
@@ -1817,13 +1852,13 @@ export default function RoomColumn({ room, rooms = [], onOpenBooking }) {
                                             }
                                             const n = parseInt(v, 10);
                                             if (!Number.isFinite(n)) return;
-                                            setEditBookingDuration(Math.max(0, Math.min(100, n)));
+                                            setEditBookingDuration(Math.max(1, n));
                                         }}
                                         className="w-[7.5rem] rounded-lg border-2 border-black bg-white px-2 py-1.5 text-xs font-bold text-black outline-none focus:bg-[#FFD400]/30"
                                     />
                                 </div>
                                 <p className="mt-1.5 text-[11px] font-semibold text-black/45">
-                                    Or type any minutes (0–100)
+                                    Or type any minutes you want
                                 </p>
                             </div>
                             <div className="flex gap-2 pt-2">
