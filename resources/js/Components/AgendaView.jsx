@@ -1,5 +1,7 @@
 import React, { useMemo, useState } from 'react';
+import { router } from '@inertiajs/react';
 import { formatPhoneDisplay } from '../lib/formatPhone';
+import { deskVisit } from '../lib/deskVisit';
 
 const DAY_START_HOUR = 12;
 const DAY_END_HOUR = 22;
@@ -81,6 +83,38 @@ export default function AgendaView({ reservations = [], rooms = [] }) {
     })();
     const [selectedDate, setSelectedDate] = useState(todayStr);
     const [selectedId, setSelectedId] = useState(null);
+    const [syncing, setSyncing] = useState(false);
+
+    function toLocalDateStr(date) {
+        const y = date.getFullYear();
+        const m = String(date.getMonth() + 1).padStart(2, '0');
+        const d = String(date.getDate()).padStart(2, '0');
+        return `${y}-${m}-${d}`;
+    }
+
+    /** Refresh only — never auto-run on date change (that froze every click ~5s). */
+    function pullWebReservations(date) {
+        if (!date || syncing) return;
+        setSyncing(true);
+        router.post(
+            '/agenda/sync',
+            { date },
+            {
+                ...deskVisit(),
+                onFinish: () => {
+                    // Background sync finishes a moment later — reload Agenda rows
+                    window.setTimeout(() => {
+                        router.reload({
+                            only: ['reservations'],
+                            preserveScroll: true,
+                            preserveState: true,
+                            onFinish: () => setSyncing(false),
+                        });
+                    }, 2000);
+                },
+            }
+        );
+    }
 
     const totalHours = DAY_END_HOUR - DAY_START_HOUR;
     const timelineWidth = totalHours * SLOT_WIDTH;
@@ -143,7 +177,7 @@ export default function AgendaView({ reservations = [], rooms = [] }) {
     const changeDate = (days) => {
         const date = new Date(`${selectedDate}T12:00:00`);
         date.setDate(date.getDate() + days);
-        setSelectedDate(date.toISOString().split('T')[0]);
+        setSelectedDate(toLocalDateStr(date));
         setSelectedId(null);
     };
 
@@ -154,10 +188,19 @@ export default function AgendaView({ reservations = [], rooms = [] }) {
                     <h2 className="text-[18px] font-black tracking-tight text-black">Agenda</h2>
                     <p className="text-[12px] font-semibold text-black/45">
                         {formatDateHeading(selectedDate)} · {dayItems.length} bookings
+                        {isToday ? ' · auto-sync on' : ''}
                     </p>
                 </div>
 
                 <div className="flex items-center gap-2">
+                    <button
+                        type="button"
+                        onClick={() => pullWebReservations(selectedDate)}
+                        disabled={syncing}
+                        className="h-9 rounded-lg border-2 border-black bg-white px-3 text-[12px] font-black text-black hover:bg-[#FFD400]/40 disabled:opacity-50"
+                    >
+                        {syncing ? 'Sync…' : 'Refresh'}
+                    </button>
                     <button
                         type="button"
                         onClick={() => {

@@ -44,7 +44,9 @@ class AgendaClient
     }
 
     /**
-     * Run Agenda HTTP work after the browser already got the redirect (desk stays snappy).
+     * Run Agenda HTTP work without blocking the next desk click.
+     * On Windows + `php artisan serve`, afterResponse still holds the worker —
+     * spawn a detached `agenda:sync` instead.
      */
     public function defer(callable $callback): void
     {
@@ -55,6 +57,33 @@ class AgendaClient
                 Log::warning('Deferred agenda task failed', ['error' => $e->getMessage()]);
             }
         })->afterResponse();
+    }
+
+    /**
+     * Background pull from agenda-waw (never blocks the HTTP response).
+     */
+    public function deferSync(?string $date = null): void
+    {
+        if (PHP_OS_FAMILY === 'Windows') {
+            $php = '"'.str_replace('"', '', PHP_BINARY).'"';
+            $artisan = '"'.str_replace('"', '', base_path('artisan')).'"';
+            $extra = '';
+            if (is_string($date) && preg_match('/^\d{4}-\d{2}-\d{2}$/', $date)) {
+                $extra = ' --date='.$date;
+            }
+            // Detached process — does not block php artisan serve
+            pclose(popen('start /B "" '.$php.' '.$artisan.' agenda:sync'.$extra, 'r'));
+
+            return;
+        }
+
+        $this->defer(function (AgendaClient $agenda) use ($date) {
+            if (is_string($date) && preg_match('/^\d{4}-\d{2}-\d{2}$/', $date)) {
+                $agenda->syncReservations($date);
+            } else {
+                $agenda->syncUpcomingDays(0, 7);
+            }
+        });
     }
 
     /**
@@ -151,7 +180,12 @@ class AgendaClient
 
     protected function isRoomFreeOnAgenda(string $date, string $timeSlot, int $roomNumber): bool
     {
-        foreach ($this->listBookings($date) as $booking) {
+        $bookings = $this->listBookings($date);
+        if ($bookings === null) {
+            return true; // fail open if agenda unreachable
+        }
+
+        foreach ($bookings as $booking) {
             if (! is_array($booking)) {
                 continue;
             }
@@ -186,10 +220,10 @@ class AgendaClient
     /**
      * @return array<int, array<string, mixed>>
      */
-    public function listBookings(?string $date = null): array
+    public function listBookings(?string $date = null): ?array
     {
         if (! $this->isConfigured()) {
-            return [];
+            return null;
         }
 
         try {
@@ -205,16 +239,16 @@ class AgendaClient
                     'body' => $response->body(),
                 ]);
 
-                return [];
+                return null;
             }
 
             $data = $response->json();
 
-            return is_array($data) ? $data : [];
+            return is_array($data) ? $data : null;
         } catch (Throwable $e) {
             Log::warning('Agenda list error', ['error' => $e->getMessage()]);
 
-            return [];
+            return null;
         }
     }
 
@@ -230,7 +264,7 @@ class AgendaClient
         }
 
         try {
-            $response = $this->http()->patch(
+            $response = $this->http(true)->patch(
                 $this->baseUrl().'/api/bookings/'.$agendaBookingId,
                 $payload
             );
@@ -322,7 +356,8 @@ class AgendaClient
         }
 
         try {
-            $response = $this->http()->post($this->baseUrl().'/api/bookings', [
+            // Desk locks must survive Vercel cold starts — use sync timeouts.
+            $response = $this->http(true)->post($this->baseUrl().'/api/bookings', [
                 'clientName' => 'Desk · '.$clientName,
                 'phone' => '0000000000',
                 'email' => 'desk@waw.local',
@@ -342,6 +377,7 @@ class AgendaClient
             if (! $response->successful()) {
                 Log::warning('Agenda block slot failed', [
                     'slot' => $timeSlot,
+                    'room' => $roomNumber,
                     'status' => $response->status(),
                     'body' => $response->body(),
                 ]);
@@ -353,13 +389,17 @@ class AgendaClient
             $id = is_array($data) ? (string) ($data['id'] ?? '') : '';
 
             if ($id !== '') {
-                $this->updateCheckInStatus($id, 'checked_in');
+                $this->http(true)->patch(
+                    $this->baseUrl().'/api/bookings/'.$id,
+                    ['checkInStatus' => 'checked_in']
+                );
             }
 
             return $id !== '' ? $id : null;
         } catch (Throwable $e) {
             Log::warning('Agenda block slot error', [
                 'slot' => $timeSlot,
+                'room' => $roomNumber,
                 'error' => $e->getMessage(),
             ]);
 
@@ -474,7 +514,7 @@ class AgendaClient
     /**
      * Pull web bookings day-by-day (today ± range) so Vercel cold starts don’t time out.
      */
-    public function syncUpcomingDays(int $fromOffset = 0, int $days = 2): int
+    public function syncUpcomingDays(int $fromOffset = 0, int $days = 14): int
     {
         $synced = 0;
         $start = Carbon::today()->addDays($fromOffset);
@@ -488,17 +528,30 @@ class AgendaClient
 
     /**
      * Pull web bookings into local reservations table for the staff agenda.
+     * Also marks local rows cancelled when the client cancelled on the web.
      */
     public function syncReservations(?string $date = null): int
     {
         $bookings = $this->listBookings($date);
+        if ($bookings === null) {
+            return 0;
+        }
+
         $synced = 0;
+        /** @var array<string, true> */
+        $activeRemoteIds = [];
+        /** @var array<string, true> */
+        $seenRemoteIds = [];
+        $datesTouched = [];
 
         foreach ($bookings as $booking) {
             try {
                 if (! is_array($booking) || empty($booking['id'])) {
                     continue;
                 }
+
+                $remoteId = (string) $booking['id'];
+                $seenRemoteIds[$remoteId] = true;
 
                 // Desk occupancy locks are not real web guests — skip agenda UI noise
                 $email = strtolower((string) ($booking['email'] ?? ''));
@@ -508,12 +561,17 @@ class AgendaClient
                 }
 
                 $remoteStatus = strtolower((string) ($booking['checkInStatus'] ?? 'pending'));
+                if (in_array($remoteStatus, ['pending', 'checked_in'], true)) {
+                    $activeRemoteIds[$remoteId] = true;
+                }
+
                 if (in_array($remoteStatus, ['cancelled', 'no_show'], true)) {
                     $dateStr = (string) ($booking['date'] ?? '');
                     $timeSlot = (string) ($booking['timeSlot'] ?? '');
                     if ($dateStr === '' || $timeSlot === '') {
                         continue;
                     }
+                    $datesTouched[$dateStr] = true;
 
                     $checkIn = Carbon::createFromFormat(
                         'Y-m-d H:i',
@@ -525,7 +583,7 @@ class AgendaClient
                     $status = $remoteStatus === 'no_show' ? 'no_show' : 'cancelled';
 
                     $existing = Reservation::query()
-                        ->where('agenda_booking_id', (string) $booking['id'])
+                        ->where('agenda_booking_id', $remoteId)
                         ->first();
 
                     $payload = [
@@ -544,7 +602,6 @@ class AgendaClient
                     ];
 
                     if ($status === 'cancelled') {
-                        // Don't overwrite a staff cancel with "web"
                         if (($existing?->cancel_source) !== 'staff') {
                             $payload['cancel_source'] = 'web';
                         }
@@ -552,7 +609,7 @@ class AgendaClient
                     }
 
                     Reservation::updateOrCreate(
-                        ['agenda_booking_id' => (string) $booking['id']],
+                        ['agenda_booking_id' => $remoteId],
                         $payload
                     );
 
@@ -565,6 +622,7 @@ class AgendaClient
                 if ($dateStr === '' || $timeSlot === '') {
                     continue;
                 }
+                $datesTouched[$dateStr] = true;
 
                 $checkIn = Carbon::createFromFormat(
                     'Y-m-d H:i',
@@ -576,7 +634,7 @@ class AgendaClient
                 $roomName = 'Room '.$roomNumber;
 
                 $existing = Reservation::query()
-                    ->where('agenda_booking_id', (string) $booking['id'])
+                    ->where('agenda_booking_id', $remoteId)
                     ->first();
 
                 $status = $this->mapRemoteStatus($booking, $existing);
@@ -587,7 +645,7 @@ class AgendaClient
                 }
 
                 Reservation::updateOrCreate(
-                    ['agenda_booking_id' => (string) $booking['id']],
+                    ['agenda_booking_id' => $remoteId],
                     [
                         'room_name' => $roomName,
                         'client_name' => (string) ($booking['clientName'] ?? 'Client web'),
@@ -613,6 +671,296 @@ class AgendaClient
             }
         }
 
+        // Client cancelled on web but local row still "confirmed" → drop from UP NEXT.
+        $datesToReconcile = $date
+            ? [$date]
+            : array_keys($datesTouched);
+
+        if ($datesToReconcile === [] && $date === null) {
+            $datesToReconcile = [
+                Carbon::today()->format('Y-m-d'),
+                Carbon::tomorrow()->format('Y-m-d'),
+            ];
+        }
+
+        foreach ($datesToReconcile as $day) {
+            $synced += $this->cancelLocalWebBookingsMissingRemotely($day, $activeRemoteIds);
+        }
+
         return $synced;
+    }
+
+    /**
+     * Any local web reservation still "confirmed" whose agenda id is no longer active remotely
+     * (cancelled / deleted) must disappear from the desk.
+     *
+     * @param  array<string, true>  $activeRemoteIds
+     */
+    protected function cancelLocalWebBookingsMissingRemotely(string $date, array $activeRemoteIds): int
+    {
+        $locals = Reservation::query()
+            ->whereDate('date', $date)
+            ->whereNotNull('agenda_booking_id')
+            ->whereIn('status', ['confirmed', 'pending'])
+            ->where(function ($q) {
+                $q->where('source', 'agenda-waw')
+                    ->orWhereNotNull('agenda_booking_id');
+            })
+            ->where(function ($q) {
+                $q->whereNull('client_email')
+                    ->orWhere('client_email', '!=', 'desk@waw.local');
+            })
+            ->where('client_name', 'not like', 'Desk ·%')
+            ->get();
+
+        $count = 0;
+        foreach ($locals as $res) {
+            $id = (string) $res->agenda_booking_id;
+            if ($id !== '' && isset($activeRemoteIds[$id])) {
+                continue;
+            }
+
+            $res->update([
+                'status' => 'cancelled',
+                'cancel_source' => $res->cancel_source === 'staff' ? 'staff' : 'web',
+                'cancelled_at' => $res->cancelled_at ?? now(),
+            ]);
+            $count++;
+        }
+
+        return $count;
+    }
+
+    /**
+     * Fast pull of today's (+ tomorrow) web cancels — safe to run on desk polls.
+     */
+    public function syncRecentCancels(): int
+    {
+        $n = $this->syncReservations(Carbon::today()->format('Y-m-d'));
+        $n += $this->syncReservations(Carbon::tomorrow()->format('Y-m-d'));
+
+        return $n;
+    }
+
+    /**
+     * Ensure every active desk booking has locked its hour(s) on agenda-waw
+     * so the public site shows Complet when both rooms are taken.
+     */
+    public function pushDeskLocksToAgenda(?string $date = null): int
+    {
+        $day = $date && preg_match('/^\d{4}-\d{2}-\d{2}$/', $date)
+            ? Carbon::parse($date)->startOfDay()
+            : Carbon::today();
+
+        $bookings = \App\Models\Booking::query()
+            ->with('room')
+            ->whereBetween('start_time', [$day->copy()->startOfDay(), $day->copy()->endOfDay()])
+            ->whereIn('status', ['confirmed', 'pending', 'in_progress'])
+            ->where(function ($q) {
+                $q->whereNull('notes')
+                    ->orWhere(function ($q2) {
+                        $q2->where('notes', 'not like', '%agenda-blocks:%')
+                            ->where('notes', 'not like', '%agenda-block:%')
+                            ->where('notes', 'not like', '%From web reservation #%');
+                    });
+            })
+            ->get();
+
+        $pushed = 0;
+        $controller = app(\App\Http\Controllers\BookingController::class);
+
+        foreach ($bookings as $booking) {
+            try {
+                $before = (string) $booking->notes;
+                $controller->blockAgendaSlotForBooking($booking->fresh(['room']));
+                $booking->refresh();
+                if ((string) $booking->notes !== $before && str_contains((string) $booking->notes, 'agenda-blocks:')) {
+                    $pushed++;
+                }
+            } catch (Throwable $e) {
+                Log::warning('pushDeskLocksToAgenda failed', [
+                    'booking' => $booking->id,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
+
+        return $pushed;
+    }
+
+    /**
+     * Cancel remote Desk · locks that no longer match an active local desk booking.
+     * Fixes "web says Complet but desk agenda is empty".
+     */
+    public function releaseOrphanDeskLocks(?string $date = null): int
+    {
+        $day = $date && preg_match('/^\d{4}-\d{2}-\d{2}$/', $date)
+            ? Carbon::parse($date)->toDateString()
+            : Carbon::today()->toDateString();
+
+        $remote = $this->listBookings($day);
+        if ($remote === null) {
+            return 0;
+        }
+
+        $activeLocalHours = [];
+        \App\Models\Booking::query()
+            ->whereDate('start_time', $day)
+            ->whereIn('status', ['confirmed', 'pending', 'in_progress'])
+            ->with('room')
+            ->get()
+            ->each(function ($b) use (&$activeLocalHours) {
+                $start = Carbon::parse($b->start_time);
+                $end = Carbon::parse($b->end_time);
+                $room = 1;
+                if ($b->room && preg_match('/(\d+)/', (string) $b->room->name, $m)) {
+                    $room = (int) $m[1];
+                }
+                $cursor = $start->copy()->minute(0)->second(0);
+                if ($cursor->lt($start)) {
+                    // already on the hour
+                }
+                while ($cursor->lt($end)) {
+                    $activeLocalHours[$cursor->format('H:i').'|'.$room] = true;
+                    $cursor->addHour();
+                }
+            });
+
+        // Also release notes-based blocks on cancelled local rows
+        $controller = app(\App\Http\Controllers\BookingController::class);
+        $stale = \App\Models\Booking::query()
+            ->whereDate('start_time', $day)
+            ->whereIn('status', ['cancelled', 'completed', 'no_show'])
+            ->where(function ($q) {
+                $q->where('notes', 'like', '%agenda-blocks:%')
+                    ->orWhere('notes', 'like', '%agenda-block:%');
+            })
+            ->get();
+
+        foreach ($stale as $booking) {
+            $controller->releaseAgendaBlocksForBooking($booking);
+            $clean = preg_replace('/\s*\|\s*agenda-blocks?:[a-f0-9\-,]+/i', '', (string) $booking->notes) ?? '';
+            $booking->update(['notes' => trim($clean, ' |')]);
+        }
+
+        $released = $stale->count();
+
+        foreach ($remote as $b) {
+            if (! is_array($b)) {
+                continue;
+            }
+            $name = (string) ($b['clientName'] ?? '');
+            $email = strtolower((string) ($b['email'] ?? ''));
+            $status = strtolower((string) ($b['checkInStatus'] ?? ''));
+            if (! ($email === 'desk@waw.local' || str_starts_with($name, 'Desk ·'))) {
+                continue;
+            }
+            if (! in_array($status, ['pending', 'checked_in'], true)) {
+                continue;
+            }
+            $slot = (string) ($b['timeSlot'] ?? '');
+            $room = (int) ($b['roomNumber'] ?? 1);
+            if (isset($activeLocalHours[$slot.'|'.$room])) {
+                continue;
+            }
+            $id = (string) ($b['id'] ?? '');
+            if ($id === '') {
+                continue;
+            }
+            if ($this->updateCheckInStatus($id, 'cancelled')) {
+                $released++;
+                Log::info('Released orphan desk lock on agenda', [
+                    'id' => $id,
+                    'slot' => $slot,
+                    'room' => $room,
+                    'name' => $name,
+                ]);
+            }
+        }
+
+        // Desk marked web guest cancelled/no_show but agenda still "pending" → free the slot.
+        $released += $this->pushTerminalWebStatusesToAgenda($day, $remote);
+
+        return $released;
+    }
+
+    /**
+     * If local reservation is cancelled/no_show but agenda-waw still has pending,
+     * push the terminal status so Complet clears / desk and web stay aligned.
+     *
+     * @param  array<int, mixed>  $remote
+     */
+    protected function pushTerminalWebStatusesToAgenda(string $day, array $remote): int
+    {
+        $byId = [];
+        foreach ($remote as $b) {
+            if (is_array($b) && ! empty($b['id'])) {
+                $byId[(string) $b['id']] = $b;
+            }
+        }
+
+        $locals = Reservation::query()
+            ->whereDate('date', $day)
+            ->whereNotNull('agenda_booking_id')
+            ->whereIn('status', ['cancelled', 'no_show'])
+            ->where(function ($q) {
+                $q->whereNull('client_email')
+                    ->orWhere('client_email', '!=', 'desk@waw.local');
+            })
+            ->where('client_name', 'not like', 'Desk ·%')
+            ->get();
+
+        $n = 0;
+        foreach ($locals as $res) {
+            $id = (string) $res->agenda_booking_id;
+            $remoteRow = $byId[$id] ?? null;
+            if (! $remoteRow) {
+                continue;
+            }
+            $remoteStatus = strtolower((string) ($remoteRow['checkInStatus'] ?? ''));
+            if (! in_array($remoteStatus, ['pending', 'checked_in'], true)) {
+                continue;
+            }
+            $target = $res->status === 'no_show' ? 'no_show' : 'cancelled';
+            if ($this->updateCheckInStatus($id, $target)) {
+                $n++;
+                Log::info('Pushed local terminal status to agenda', [
+                    'id' => $id,
+                    'status' => $target,
+                    'client' => $res->client_name,
+                ]);
+            }
+        }
+
+        return $n;
+    }
+
+    /**
+     * Visit counts + recent web bookings from agenda-waw (/api/stats).
+     *
+     * @return array<string, mixed>|null
+     */
+    public function getSiteStats(): ?array
+    {
+        if (! $this->isConfigured()) {
+            return null;
+        }
+
+        try {
+            $response = $this->http(true)->get($this->baseUrl().'/api/stats');
+            if (! $response->successful()) {
+                Log::warning('Agenda stats failed', ['status' => $response->status()]);
+
+                return null;
+            }
+
+            $payload = $response->json();
+
+            return is_array($payload) ? $payload : null;
+        } catch (Throwable $e) {
+            Log::warning('Agenda stats skipped', ['error' => $e->getMessage()]);
+
+            return null;
+        }
     }
 }

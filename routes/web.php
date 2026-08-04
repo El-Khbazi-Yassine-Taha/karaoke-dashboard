@@ -1,6 +1,7 @@
 <?php
 
 use App\Http\Controllers\AdminUserController;
+use App\Http\Controllers\AdminWebController;
 use App\Http\Controllers\AgendaAvailabilityController;
 use App\Http\Controllers\AuthController;
 use App\Http\Controllers\BookingController;
@@ -21,6 +22,7 @@ Route::post('/logout', [AuthController::class, 'logout'])->middleware('auth')->n
 Route::middleware('auth')->group(function () {
     Route::get('/dashboard', [DashboardController::class, 'index'])->name('dashboard');
     Route::get('/dashboard/status', [DashboardController::class, 'status'])->name('dashboard.status');
+    Route::post('/agenda/sync', [DashboardController::class, 'syncNow'])->name('agenda.sync');
     Route::get('/agenda/availability', AgendaAvailabilityController::class)->name('agenda.availability');
 
     Route::post('/bookings/{booking}/toggle-paid', [BookingController::class, 'togglePaid'])->name('bookings.togglePaid');
@@ -48,6 +50,7 @@ Route::middleware('auth')->group(function () {
         Route::post('/users', [AdminUserController::class, 'store'])->name('users.store');
         Route::put('/users/{user}', [AdminUserController::class, 'update'])->name('users.update');
         Route::delete('/users/{user}', [AdminUserController::class, 'destroy'])->name('users.destroy');
+        Route::get('/web', [AdminWebController::class, 'index'])->name('web.index');
     });
 });
 

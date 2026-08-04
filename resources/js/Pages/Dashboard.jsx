@@ -38,7 +38,7 @@ export default function Dashboard({
             } catch (err) {
                 console.error('[dashboard poll]', err);
             }
-        }, 20000);
+        }, 15000); // UI refresh; server also pulls web bookings in the background
         return () => window.clearInterval(interval);
     }, []);
 

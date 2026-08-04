@@ -25,12 +25,15 @@ class DashboardController extends Controller
 
     public function index(Request $request): Response
     {
-        // Partial reloads (every desk click) must stay local+fast.
-        // Full page load may pull web reservations in the background.
         $isPartial = $request->header('X-Inertia-Partial-Data') !== null;
 
         if (! $isPartial) {
+            // Full page load: wider sync in background (detached on Windows).
             $this->syncAgendaQuietly();
+        } else {
+            // Desk auto-poll (~20s): pull today's web bookings in BG so staff
+            // don't need to hit Refresh for new / cancelled online reservations.
+            $this->syncAgendaOnPoll();
         }
 
         $payload = array_merge($this->availability->getDashboardPayload(! $isPartial), [
@@ -45,7 +48,8 @@ class DashboardController extends Controller
      */
     public function status(): JsonResponse
     {
-        // Polls must stay fast — skip agenda sync + schedule repair (mutations already repair).
+        $this->syncAgendaOnPoll();
+
         $payload = array_merge($this->availability->getDashboardPayload(false), [
             'reservations' => $this->reservationsPayload(),
         ]);
@@ -83,6 +87,20 @@ class DashboardController extends Controller
         return back()->with('success', 'Room checked out and is now free.');
     }
 
+    /**
+     * Staff Refresh — starts sync in background, returns immediately (no 5s freeze).
+     */
+    public function syncNow(Request $request): RedirectResponse
+    {
+        $date = $request->input('date');
+        $date = is_string($date) && preg_match('/^\d{4}-\d{2}-\d{2}$/', $date) ? $date : null;
+
+        Cache::forget('agenda-sync-throttle');
+        $this->agenda->deferSync($date);
+
+        return back();
+    }
+
     private function reservationsPayload(): array
     {
         $from = Carbon::today()->subDay()->startOfDay();
@@ -114,9 +132,15 @@ class DashboardController extends Controller
                     'members_count' => $res->members_count,
                     'total_price' => $res->total_price,
                     'payment_status' => $res->payment_status,
-                    'check_in' => optional($res->check_in)->format('Y-m-d H:i:s'),
-                    'check_out' => optional($res->check_out)->format('Y-m-d H:i:s'),
-                    'date' => optional($res->date)->format('Y-m-d'),
+                    'check_in' => $res->check_in
+                        ? Carbon::parse($res->check_in)->timezone(config('app.timezone'))->format('Y-m-d H:i:s')
+                        : null,
+                    'check_out' => $res->check_out
+                        ? Carbon::parse($res->check_out)->timezone(config('app.timezone'))->format('Y-m-d H:i:s')
+                        : null,
+                    'date' => $res->date
+                        ? Carbon::parse($res->date)->timezone(config('app.timezone'))->format('Y-m-d')
+                        : null,
                     'status' => $res->status,
                     'source' => 'agenda-waw',
                     'agenda_booking_id' => $res->agenda_booking_id,
@@ -127,17 +151,25 @@ class DashboardController extends Controller
 
     private function syncAgendaQuietly(): void
     {
-        // Never block the dashboard — sync after the response, and keep it small
-        // so php artisan serve isn’t busy for the next click.
         if (Cache::has('agenda-sync-throttle')) {
             return;
         }
 
-        Cache::put('agenda-sync-throttle', true, 30);
+        Cache::put('agenda-sync-throttle', true, 60);
+        $this->agenda->deferSync(null);
+    }
 
-        $this->agenda->defer(function (AgendaClient $agenda) {
-            // Today + tomorrow only (not a full week of Vercel round-trips).
-            $agenda->syncUpcomingDays(0, 2);
-        });
+    /**
+     * Non-blocking sync used by the desk auto-poll (Inertia partial + /status).
+     * Detached on Windows so the UI never freezes waiting on Vercel.
+     */
+    private function syncAgendaOnPoll(): void
+    {
+        if (Cache::has('agenda-poll-sync-throttle')) {
+            return;
+        }
+
+        Cache::put('agenda-poll-sync-throttle', true, 25);
+        $this->agenda->deferSync(Carbon::today()->format('Y-m-d'));
     }
 }

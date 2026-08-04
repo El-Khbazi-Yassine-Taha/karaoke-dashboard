@@ -22,8 +22,19 @@ class SyncAgendaBookings extends Command
         $date = $this->option('date') ?: null;
         $count = $date
             ? $agenda->syncReservations($date)
-            : $agenda->syncUpcomingDays();
+            : $agenda->syncUpcomingDays(0, 7);
         $this->info("Synced {$count} reservation(s) from agenda-waw.");
+
+        // Desk → web: lock hours so Complet shows when rooms are taken at the desk.
+        $pushed = $agenda->pushDeskLocksToAgenda($date);
+        if ($pushed > 0) {
+            $this->info("Pushed {$pushed} desk lock(s) to agenda-waw.");
+        }
+
+        $released = $agenda->releaseOrphanDeskLocks($date);
+        if ($released > 0) {
+            $this->info("Released {$released} orphan desk lock(s) on agenda-waw.");
+        }
 
         return self::SUCCESS;
     }

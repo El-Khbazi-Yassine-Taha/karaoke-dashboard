@@ -12,6 +12,9 @@ use Illuminate\Validation\Rule;
 
 class BookingController extends Controller
 {
+    /** Next guest may wait at most this many minutes (e.g. you end 12:10, they booked 12:00). */
+    public const MAX_NEXT_DELAY_MINUTES = 10;
+
     /**
      * 1–4 members: 200 DHS · 5+: +40 DHS each above 4
      */
@@ -25,15 +28,50 @@ class BookingController extends Controller
     }
 
     /**
-     * Earliest start that fits $durationMinutes in a free gap (not after the last booking).
-     * Example: live until 17:11, next at 20:03, 60 min → starts at 17:11 (uses the gap).
+     * Earliest start that fits $durationMinutes without delaying the next guest > 10 min.
+     * Includes web reservations. Example: next at 12:00, duration 60 → need start ≤ 11:10
+     * (ends 12:10 = +10 max), otherwise jumps after that reservation ends.
      */
     public static function findNextAvailableStart(int $roomId, int $durationMinutes, ?Carbon $now = null): Carbon
     {
         $now = $now ? $now->copy() : Carbon::now();
-        $startOfDay = (clone $now)->startOfDay();
-        $endOfDay = (clone $now)->endOfDay();
         $durationMinutes = max(1, $durationMinutes);
+        $blocks = self::busyBlocksForRoom($roomId, $now);
+        $grace = self::MAX_NEXT_DELAY_MINUTES;
+
+        $cursor = $now->copy();
+
+        foreach ($blocks as $block) {
+            $bStart = $block['start'];
+            $bEnd = $block['end'];
+
+            if ($bStart->lte($cursor) && $bEnd->gt($cursor)) {
+                $cursor = $bEnd->copy();
+                continue;
+            }
+
+            if ($bStart->gt($cursor)) {
+                // Allowed if we finish by nextStart + 10 min grace
+                if ($cursor->copy()->addMinutes($durationMinutes)->lte($bStart->copy()->addMinutes($grace))) {
+                    return $cursor;
+                }
+                $cursor = $bEnd->gt($cursor) ? $bEnd->copy() : $cursor;
+            }
+        }
+
+        return $cursor;
+    }
+
+    /**
+     * Local bookings + web reservations for this room today (sorted).
+     *
+     * @return array<int, array{start: Carbon, end: Carbon, name: string, booking_id: ?int}>
+     */
+    public static function busyBlocksForRoom(int $roomId, Carbon $around): array
+    {
+        $startOfDay = $around->copy()->startOfDay();
+        $endOfDay = $around->copy()->endOfDay();
+        $blocks = [];
 
         $bookings = Booking::where('room_id', $roomId)
             ->whereBetween('start_time', [$startOfDay, $endOfDay])
@@ -41,60 +79,132 @@ class BookingController extends Controller
             ->orderBy('start_time')
             ->get();
 
-        $cursor = $now->copy();
-
-        $live = $bookings->first(function (Booking $b) use ($now) {
-            if ($b->status !== 'in_progress') {
-                return false;
-            }
-            $start = Carbon::parse($b->start_time);
-            $end = Carbon::parse($b->end_time);
-
-            return $start->lte($now) && $end->gt($now);
-        });
-
-        if ($live) {
-            $cursor = Carbon::parse($live->end_time);
-        }
-
-        // Also treat pending/confirmed that already overlap "now" as blocking the cursor
         foreach ($bookings as $b) {
-            if ($live && $b->id === $live->id) {
-                continue;
-            }
-            $bStart = Carbon::parse($b->start_time);
-            $bEnd = Carbon::parse($b->end_time);
-            if ($bStart->lte($cursor) && $bEnd->gt($cursor)) {
-                $cursor = $bEnd->copy();
-            }
+            $blocks[] = [
+                'start' => Carbon::parse($b->start_time),
+                'end' => Carbon::parse($b->end_time),
+                'name' => (string) $b->client_name,
+                'booking_id' => (int) $b->id,
+            ];
         }
 
-        $upcoming = $bookings
-            ->reject(fn (Booking $b) => $live && $b->id === $live->id)
-            ->filter(fn (Booking $b) => Carbon::parse($b->end_time)->gt($cursor))
-            ->sortBy(fn (Booking $b) => Carbon::parse($b->start_time)->timestamp)
-            ->values();
+        $room = Room::find($roomId);
+        if ($room) {
+            $web = Reservation::query()
+                ->where('room_name', $room->name)
+                ->whereDate('date', $around->toDateString())
+                ->whereNotIn('status', ['cancelled', 'no_show', 'completed'])
+                ->where(function ($q) {
+                    $q->whereNull('client_email')
+                        ->orWhere('client_email', '!=', 'desk@waw.local');
+                })
+                ->where('client_name', 'not like', 'Desk ·%')
+                ->orderBy('check_in')
+                ->get();
 
-        foreach ($upcoming as $b) {
-            $bStart = Carbon::parse($b->start_time);
-            $bEnd = Carbon::parse($b->end_time);
-
-            if ($bStart->lte($cursor)) {
-                if ($bEnd->gt($cursor)) {
-                    $cursor = $bEnd->copy();
+            foreach ($web as $res) {
+                // Skip if already mirrored as a desk booking from this web row
+                $already = $bookings->contains(
+                    fn (Booking $b) => str_contains((string) $b->notes, 'From web reservation #'.$res->id)
+                );
+                if ($already) {
+                    continue;
                 }
+
+                $blocks[] = [
+                    'start' => Carbon::parse($res->check_in),
+                    'end' => Carbon::parse($res->check_out),
+                    'name' => 'Web · '.$res->client_name,
+                    'booking_id' => null,
+                ];
+            }
+        }
+
+        usort($blocks, fn ($a, $b) => $a['start']->timestamp <=> $b['start']->timestamp);
+
+        return $blocks;
+    }
+
+    /**
+     * Null if slot is allowed; otherwise the conflicting block (+ delay_minutes when relevant).
+     *
+     * Rules:
+     * - Cannot start inside someone else's reservation.
+     * - May run past the next guest's start by at most MAX_NEXT_DELAY_MINUTES (10).
+     * - More than that → blocked (cancel their reservation first, or shorten duration).
+     *
+     * @return null|array{start: Carbon, end: Carbon, name: string, booking_id: ?int, delay_minutes?: int, reason?: string}
+     */
+    public static function findOverlapConflict(
+        int $roomId,
+        Carbon $start,
+        Carbon $end,
+        ?int $excludeBookingId = null
+    ): ?array {
+        $grace = self::MAX_NEXT_DELAY_MINUTES;
+
+        foreach (self::busyBlocksForRoom($roomId, $start) as $block) {
+            if ($excludeBookingId && ($block['booking_id'] ?? null) === $excludeBookingId) {
                 continue;
             }
 
-            // Gap from $cursor until this booking starts
-            if ($cursor->copy()->addMinutes($durationMinutes)->lte($bStart)) {
-                return $cursor;
+            // Starting inside an existing booking/reservation
+            if ($start->gte($block['start']) && $start->lt($block['end'])) {
+                return array_merge($block, [
+                    'delay_minutes' => 0,
+                    'reason' => 'inside',
+                ]);
             }
 
-            $cursor = $bEnd->gt($cursor) ? $bEnd->copy() : $cursor->copy();
+            // We start before them but finish after their start → we delay them
+            if ($start->lt($block['start']) && $end->gt($block['start'])) {
+                $delayMins = (int) $block['start']->diffInMinutes($end, false);
+                if ($delayMins > $grace) {
+                    return array_merge($block, [
+                        'delay_minutes' => $delayMins,
+                        'reason' => 'delay',
+                    ]);
+                }
+                // ≤ 10 min delay: allowed (next guest waits a bit)
+            }
         }
 
-        return $cursor;
+        return null;
+    }
+
+    /**
+     * Human-readable block message for desk staff.
+     */
+    public static function conflictErrorMessage(array $conflict, Carbon $start, Carbon $end, int $duration): string
+    {
+        $grace = self::MAX_NEXT_DELAY_MINUTES;
+        $name = $conflict['name'];
+        $nextStart = $conflict['start']->format('H:i');
+        $nextEnd = $conflict['end']->format('H:i');
+
+        if (($conflict['reason'] ?? '') === 'inside') {
+            return sprintf(
+                'Impossible : « %s » occupe déjà %s–%s. Annule cette réservation d’abord, ou choisis un autre créneau.',
+                $name,
+                $nextStart,
+                $nextEnd
+            );
+        }
+
+        $delay = (int) ($conflict['delay_minutes'] ?? 0);
+        $maxFit = max(0, (int) $start->diffInMinutes($conflict['start'], false) + $grace);
+
+        return sprintf(
+            'Impossible : %d min (fin %s) retarderait « %s » (%s) de %d min — max autorisé %d min. Annule d’abord la résa de %s, ou raccourcis à ≤ %d min.',
+            $duration,
+            $end->format('H:i'),
+            $name,
+            $nextStart,
+            $delay,
+            $grace,
+            $nextStart,
+            $maxFit
+        );
     }
 
     /**
@@ -240,40 +350,44 @@ class BookingController extends Controller
             || empty($startClockTime);
 
         if ($isStartNow) {
-            // Use the first free gap (after live session / between bookings),
-            // NOT max(end_time) which skips hours of free time.
-            $startTime = self::findNextAvailableStart((int) $room->id, $duration, $now);
+            // Start now only if the full duration fits before the next desk/web booking.
+            $startTime = $now->copy();
+            if ($live = Booking::liveSessionInRoom((int) $room->id)) {
+                return back()->withErrors([
+                    'room_id' => sprintf(
+                        'Room is live with %s until %s. Check them out before starting another session.',
+                        $live->client_name,
+                        Carbon::parse($live->end_time)->format('H:i')
+                    ),
+                ]);
+            }
+            $endTime = (clone $startTime)->addMinutes($duration);
+            $conflict = self::findOverlapConflict((int) $room->id, $startTime, $endTime);
+            if ($conflict) {
+                return back()->withErrors([
+                    'duration_minutes' => self::conflictErrorMessage($conflict, $startTime, $endTime, $duration),
+                ]);
+            }
         } else {
             $timeClean = trim($startClockTime);
             if (strlen($timeClean) === 5) {
                 $timeClean .= ':00';
             }
             $startTime = Carbon::parse("{$todayDate} {$timeClean}");
+            $endTime = (clone $startTime)->addMinutes($duration);
+            $conflict = self::findOverlapConflict((int) $room->id, $startTime, $endTime);
+            if ($conflict) {
+                return back()->withErrors([
+                    'start_clock_time' => self::conflictErrorMessage($conflict, $startTime, $endTime, $duration),
+                ]);
+            }
         }
-
-        $endTime = (clone $startTime)->addMinutes($duration);
 
         $closingLimit = Carbon::parse("{$todayDate} 23:00:00");
         if ($endTime->greaterThan($closingLimit)) {
             return back()->withErrors([
                 'duration_minutes' => 'The venue closes at 23:00. This session would end after closing time.',
             ]);
-        }
-
-        // Prevent double-booking a web-reserved hour on this room.
-        $agenda = app(AgendaClient::class);
-        if ($agenda->isConfigured()) {
-            $slotHour = $startTime->format('H').':00';
-            $roomNumber = 1;
-            if (preg_match('/(\d+)/', (string) $room->name, $m)) {
-                $roomNumber = (int) $m[1];
-            }
-
-            if (! $agenda->isSlotFree($todayDate, $slotHour, $roomNumber)) {
-                return back()->withErrors([
-                    'start_clock_time' => 'Déjà réservé (web) — ce créneau est pris sur agenda-waw pour cette salle.',
-                ]);
-            }
         }
 
         // Walk-ins: wait for payment method before starting the timer.
@@ -326,13 +440,10 @@ class BookingController extends Controller
         }
 
         if (in_array($created->status, ['in_progress', 'confirmed', 'pending'], true)) {
-            $bookingId = (int) $created->id;
-            app(AgendaClient::class)->defer(function () use ($bookingId) {
-                $booking = Booking::with('room')->find($bookingId);
-                if ($booking) {
-                    app(BookingController::class)->blockAgendaSlotForBooking($booking);
-                }
-            });
+            // Detached sync also pushes desk locks to agenda (Windows-safe).
+            app(AgendaClient::class)->deferSync(
+                Carbon::parse($created->start_time)->format('Y-m-d')
+            );
         }
 
         return redirect()->back();
@@ -366,18 +477,22 @@ class BookingController extends Controller
             ]);
 
             $bookingId = (int) $booking->id;
-            $snapshotNotes = (string) $booking->fresh()->notes;
-            app(AgendaClient::class)->defer(function () use ($bookingId, $snapshotNotes) {
-                $fresh = Booking::find($bookingId);
-                $controller = app(BookingController::class);
-                if ($fresh) {
-                    $controller->releaseAgendaBlocksForBooking($fresh);
-                } else {
-                    $controller->releaseAgendaBlocksForBooking(new Booking(['notes' => $snapshotNotes]));
+            $snapshotNotes = (string) ($booking->fresh()->notes ?? $booking->notes);
+            try {
+                $this->releaseAgendaBlocksForBooking(new Booking(['notes' => $snapshotNotes]));
+                $clean = preg_replace('/\s*\|\s*agenda-blocks?:[a-f0-9\-,]+/i', '', $snapshotNotes) ?? '';
+                if ($fresh = Booking::find($bookingId)) {
+                    $fresh->update(['notes' => trim($clean, ' |')]);
                 }
-            });
+            } catch (\Throwable $e) {
+                \Illuminate\Support\Facades\Log::warning('Agenda release on early checkout failed', [
+                    'booking' => $bookingId,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+            app(AgendaClient::class)->deferSync($now->format('Y-m-d'));
 
-            if (preg_match('/From web reservation #(\d+)/', (string) $booking->notes, $m)) {
+            if (preg_match('/From web reservation #(\d+)/', $snapshotNotes, $m)) {
                 $reservation = Reservation::find((int) $m[1]);
                 if ($reservation) {
                     $reservation->update([
@@ -386,10 +501,10 @@ class BookingController extends Controller
                         'cancelled_at' => $now,
                     ]);
                     if ($reservation->agenda_booking_id) {
-                        $agendaId = (string) $reservation->agenda_booking_id;
-                        app(AgendaClient::class)->defer(function (AgendaClient $agenda) use ($agendaId) {
-                            $agenda->updateCheckInStatus($agendaId, 'cancelled');
-                        });
+                        app(AgendaClient::class)->updateCheckInStatus(
+                            (string) $reservation->agenda_booking_id,
+                            'cancelled'
+                        );
                     }
                 }
             }
@@ -505,6 +620,13 @@ class BookingController extends Controller
             ]);
         }
 
+        $conflict = self::findOverlapConflict((int) $booking->room_id, $now, $endTime, (int) $booking->id);
+        if ($conflict) {
+            return back()->withErrors([
+                'start' => self::conflictErrorMessage($conflict, $now, $endTime, $duration),
+            ]);
+        }
+
         $booking->update([
             'status' => 'in_progress',
             'start_time' => $now,
@@ -516,13 +638,9 @@ class BookingController extends Controller
         ]);
 
         // Block agenda after the response so check-in stays instant
-        $bookingId = (int) $booking->id;
-        app(AgendaClient::class)->defer(function () use ($bookingId) {
-            $fresh = Booking::with('room')->find($bookingId);
-            if ($fresh) {
-                app(BookingController::class)->blockAgendaSlotForBooking($fresh);
-            }
-        });
+        app(AgendaClient::class)->deferSync(
+            Carbon::parse($booking->start_time)->format('Y-m-d')
+        );
 
         self::repairRoomSchedule($booking->room_id);
 
@@ -812,6 +930,21 @@ class BookingController extends Controller
             ]);
         }
 
+        $conflict = self::findOverlapConflict(
+            (int) $booking->room_id,
+            Carbon::parse($booking->start_time),
+            $newEnd,
+            (int) $booking->id
+        );
+        if ($conflict) {
+            $start = Carbon::parse($booking->start_time);
+            $duration = max(1, (int) $start->diffInMinutes($newEnd));
+
+            return back()->withErrors([
+                'extend' => self::conflictErrorMessage($conflict, $start, $newEnd, $duration),
+            ]);
+        }
+
         $start = Carbon::parse($booking->start_time);
         $booking->update([
             'end_time' => $newEnd,
@@ -858,22 +991,15 @@ class BookingController extends Controller
         $start = Carbon::parse($booking->start_time);
         $end = Carbon::parse($booking->end_time);
 
-        $conflict = Booking::query()
-            ->where('room_id', $target->id)
-            ->where('id', '!=', $booking->id)
-            ->whereNotIn('status', ['cancelled', 'no_show', 'completed'])
-            ->where('start_time', '<', $end)
-            ->where('end_time', '>', $start)
-            ->first();
-
+        $conflict = self::findOverlapConflict((int) $target->id, $start, $end, (int) $booking->id);
         if ($conflict) {
             return back()->withErrors([
                 'room' => sprintf(
                     '%s is busy with %s (%s–%s).',
                     $target->name,
-                    $conflict->client_name,
-                    Carbon::parse($conflict->start_time)->format('H:i'),
-                    Carbon::parse($conflict->end_time)->format('H:i')
+                    $conflict['name'],
+                    $conflict['start']->format('H:i'),
+                    $conflict['end']->format('H:i')
                 ),
             ]);
         }
@@ -927,29 +1053,22 @@ class BookingController extends Controller
 
         $bookingId = (int) $booking->id;
         $notes = (string) $booking->notes;
-        app(AgendaClient::class)->defer(function () use ($bookingId, $notes) {
-            $fresh = Booking::find($bookingId);
-            $controller = app(BookingController::class);
-            if ($fresh) {
-                $controller->releaseAgendaBlocksForBooking($fresh);
-            } else {
-                // Booking row may still have notes snapshot
-                $tmp = new Booking(['notes' => $notes]);
-                $controller->releaseAgendaBlocksForBooking($tmp);
-            }
+        // Release desk locks on agenda immediately (Windows-safe via detached sync).
+        try {
+            $this->releaseAgendaBlocksForBooking($booking);
+            $clean = preg_replace('/\s*\|\s*agenda-blocks?:[a-f0-9\-,]+/i', '', $notes) ?? '';
+            $booking->update(['notes' => trim($clean, ' |')]);
+        } catch (\Throwable $e) {
+            \Illuminate\Support\Facades\Log::warning('Agenda release on cancel failed', [
+                'booking' => $bookingId,
+                'error' => $e->getMessage(),
+            ]);
+        }
+        app(AgendaClient::class)->deferSync(
+            Carbon::parse($booking->start_time)->format('Y-m-d')
+        );
 
-            if (preg_match('/From web reservation #(\d+)/', $notes, $m)) {
-                $reservation = Reservation::find((int) $m[1]);
-                if ($reservation?->agenda_booking_id) {
-                    app(AgendaClient::class)->updateCheckInStatus(
-                        (string) $reservation->agenda_booking_id,
-                        'cancelled'
-                    );
-                }
-            }
-        });
-
-        if (preg_match('/From web reservation #(\d+)/', (string) $booking->notes, $m)) {
+        if (preg_match('/From web reservation #(\d+)/', $notes, $m)) {
             $reservation = Reservation::find((int) $m[1]);
             if ($reservation) {
                 $reservation->update([
@@ -957,6 +1076,12 @@ class BookingController extends Controller
                     'cancel_source' => 'staff',
                     'cancelled_at' => now(),
                 ]);
+                if ($reservation->agenda_booking_id) {
+                    $agendaId = (string) $reservation->agenda_booking_id;
+                    app(AgendaClient::class)->defer(function (AgendaClient $agenda) use ($agendaId) {
+                        $agenda->updateCheckInStatus($agendaId, 'cancelled');
+                    });
+                }
             }
         }
 

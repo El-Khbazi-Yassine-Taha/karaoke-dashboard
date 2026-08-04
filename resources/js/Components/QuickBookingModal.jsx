@@ -267,20 +267,14 @@ export default function QuickBookingModal({ open, onClose, rooms, selectedRoomId
 
             if (upStart > proposedStart && proposedEnd > upStart) {
                 const overlapMinutes = proposedEnd - upStart;
-                if (overlapMinutes <= 10) {
-                    return {
-                        status: 'warning',
-                        clientName: b.clientName,
-                        start: b.start,
-                        proposedEndStr: minsToTime(proposedEnd),
-                        overlapMinutes,
-                    };
-                }
+                const maxBefore = Math.max(0, upStart - proposedStart);
                 return {
                     status: 'blocked',
                     clientName: b.clientName,
                     start: b.start,
+                    end: b.end,
                     overlapMinutes,
+                    maxBefore,
                 };
             }
         }
@@ -306,27 +300,20 @@ export default function QuickBookingModal({ open, onClose, rooms, selectedRoomId
 
         if (collisionState.status === 'blocked') {
             alert(
-                `ACTION BLOCKED:\n\nThis booking overflows into ${collisionState.clientName}'s reservation by ${collisionState.overlapMinutes} minutes. The maximum allowed delay buffer is 10 minutes!`
+                `IMPOSSIBLE:\n\nÇa chevaucherait « ${collisionState.clientName} » (${collisionState.start}–${collisionState.end || '?'}).\nMaximum avant le prochain : ${collisionState.maxBefore ?? 0} min.`
             );
             return;
-        }
-
-        if (collisionState.status === 'warning') {
-            const confirmed = window.confirm(
-                `10-MINUTE BUFFER:\n\nThis will delay ${collisionState.clientName}'s start by ${collisionState.overlapMinutes} minutes (to ${collisionState.proposedEndStr}). Continue?`
-            );
-            if (!confirmed) return;
         }
 
         setSubmitting(true);
         setServerErrors({});
 
-        // If staff picked a gap (or stack next slot), send that clock time.
-        // "start_now" only when we truly want the server gap-finder and no explicit slot.
-        const usingExplicitSlot = !startNow || Boolean(selectedGapStart);
-        const startClock = usingExplicitSlot
-            ? clockTime
-            : null;
+        // Only "start now" when the proposed slot is actually now.
+        // If the next free gap is later (e.g. after a web booking), send that clock time.
+        const nowMins = timeToMins(currentHHMM());
+        const proposedMins = timeToMins(proposedStartTime);
+        const isLiterallyNow =
+            Boolean(startNow) && !selectedGapStart && proposedMins <= nowMins + 1;
 
         router.post(
             '/bookings',
@@ -334,8 +321,8 @@ export default function QuickBookingModal({ open, onClose, rooms, selectedRoomId
                 client_name: clientName,
                 client_phone: clientPhone.trim() || null,
                 room_id: roomId,
-                start_now: usingExplicitSlot ? 0 : 1,
-                start_clock_time: usingExplicitSlot ? startClock : null,
+                start_now: isLiterallyNow ? 1 : 0,
+                start_clock_time: isLiterallyNow ? null : proposedStartTime,
                 duration_minutes: effectiveDuration,
                 members_count: parsedMembers,
                 is_paid: 0,
@@ -666,21 +653,22 @@ export default function QuickBookingModal({ open, onClose, rooms, selectedRoomId
                                 Blocked: {collisionState.message}
                             </div>
                         )}
-                        {collisionState.status === 'warning' && (
-                            <div className="rounded-xl border border-[#E8E4D9] bg-[#FFFBEA] p-3 text-xs font-medium leading-relaxed text-[#6B4E00]">
-                                Buffer notice: pushes into {collisionState.clientName} by{' '}
-                                {collisionState.overlapMinutes} min.
-                            </div>
-                        )}
                         {collisionState.status === 'blocked' && (
                             <div className="rounded-xl border border-[#F5D0C8] bg-[#FFF5F3] p-3 text-xs font-medium leading-relaxed text-[#B42318]">
-                                Blocked: overlaps {collisionState.clientName} by {collisionState.overlapMinutes}{' '}
-                                min (over 10-min buffer).
+                                Impossible : chevauche « {collisionState.clientName} » (
+                                {collisionState.start}
+                                {collisionState.end ? `–${collisionState.end}` : ''}). Maximum avant le
+                                prochain : {collisionState.maxBefore ?? 0} min.
                             </div>
                         )}
                         {collisionState.status === 'closing_violation' && (
                             <div className="rounded-xl border border-[#F5D0C8] bg-[#FFF5F3] p-3 text-xs font-medium leading-relaxed text-[#B42318]">
                                 {collisionState.message}
+                            </div>
+                        )}
+                        {serverErrors.duration_minutes && (
+                            <div className="rounded-xl border border-[#F5D0C8] bg-[#FFF5F3] p-3 text-xs font-medium text-[#B42318]">
+                                {serverErrors.duration_minutes}
                             </div>
                         )}
                         {serverErrors.start_clock_time && (
@@ -710,11 +698,7 @@ export default function QuickBookingModal({ open, onClose, rooms, selectedRoomId
                             }
                             className="btn-waw"
                         >
-                            {submitting
-                                ? 'Booking…'
-                                : collisionState.status === 'warning'
-                                  ? 'Force booking'
-                                  : 'Confirm booking'}
+                            {submitting ? 'Booking…' : 'Confirm booking'}
                         </button>
                     </div>
                 </form>

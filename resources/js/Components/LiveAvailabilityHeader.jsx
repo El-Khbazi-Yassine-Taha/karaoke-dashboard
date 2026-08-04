@@ -105,7 +105,7 @@ export default function LiveAvailabilityHeader({ serverTimestamp }) {
                             aria-label="Close menu"
                             onClick={() => setMenuOpen(false)}
                         />
-                        <div className="absolute right-0 z-[100] mt-2 w-52 overflow-hidden rounded-xl border-2 border-black bg-[#FFFDF5] p-1.5 shadow-[3px_3px_0_#000]">
+                        <div className="absolute right-0 z-[100] mt-2 w-56 overflow-hidden rounded-xl border-2 border-black bg-[#FFFDF5] p-1.5 shadow-[3px_3px_0_#000]">
                             <div className="mb-1 border-b border-black/10 px-3 py-2">
                                 <p className="truncate text-sm font-black capitalize text-black">
                                     {userName}
@@ -118,16 +118,28 @@ export default function LiveAvailabilityHeader({ serverTimestamp }) {
                             </div>
 
                             {isAdmin && (
-                                <button
-                                    type="button"
-                                    onClick={() => {
-                                        setMenuOpen(false);
-                                        router.visit('/admin/users');
-                                    }}
-                                    className="w-full rounded-lg px-3 py-2.5 text-left text-xs font-bold text-black transition hover:bg-[#FFD400]/50"
-                                >
-                                    Manage users
-                                </button>
+                                <>
+                                    <button
+                                        type="button"
+                                        onClick={() => {
+                                            setMenuOpen(false);
+                                            router.visit('/admin/users');
+                                        }}
+                                        className="w-full rounded-lg px-3 py-2.5 text-left text-xs font-bold text-black transition hover:bg-[#FFD400]/50"
+                                    >
+                                        Manage users
+                                    </button>
+                                    <button
+                                        type="button"
+                                        onClick={() => {
+                                            setMenuOpen(false);
+                                            router.visit('/admin/web');
+                                        }}
+                                        className="w-full rounded-lg px-3 py-2.5 text-left text-xs font-bold text-black transition hover:bg-[#FFD400]/50"
+                                    >
+                                        Web bookings & visits
+                                    </button>
+                                </>
                             )}
 
                             <button
